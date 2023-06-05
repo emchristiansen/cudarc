@@ -46,7 +46,7 @@ unsafe impl Sync for CudaDevice {}
 
 impl CudaDevice {
     /// Creates a new [CudaDevice] on device index `ordinal`.
-    pub fn new(ordinal: usize) -> Result<Arc<Self>, result::DriverError> {
+    pub fn new_raw(ordinal: usize) -> Result<Self, result::DriverError> {
         result::init().unwrap();
 
         let cu_device = result::device::get(ordinal as i32).unwrap();
@@ -67,7 +67,12 @@ impl CudaDevice {
             modules: RwLock::new(BTreeMap::new()),
             ordinal,
         };
-        Ok(Arc::new(device))
+        Ok(device)
+    }
+
+    /// Creates a new [CudaDevice] on device index `ordinal`.
+    pub fn new(ordinal: usize) -> Result<Arc<Self>, result::DriverError> {
+        Self::new_raw(ordinal).map(Arc::new)
     }
 
     /// Get the `ordinal` index of this [CudaDevice].
@@ -113,6 +118,7 @@ impl CudaDevice {
     }
 
     pub fn set_cu_stream(&mut self, stream: sys::CUstream) {
+        assert!(!stream.is_null());
         self.stream = stream;
     }
 
