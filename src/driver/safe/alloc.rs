@@ -2,6 +2,7 @@ use crate::driver::{result, sys};
 
 use super::core::{CudaDevice, CudaSlice, CudaView, CudaViewMut};
 use super::device_ptr::{DevicePtr, DevicePtrMut, DeviceSlice};
+use super::CudaStream;
 
 use std::{marker::Unpin, pin::Pin, sync::Arc, vec::Vec};
 
@@ -200,8 +201,16 @@ impl CudaDevice {
         self: &Arc<Self>,
         src: Vec<T>,
     ) -> Result<CudaSlice<T>, result::DriverError> {
+        self.htod_copy_on_stream(self.stream, src)
+    }
+
+    pub fn htod_copy_on_stream<T: Unpin + DeviceRepr>(
+        self: &Arc<Self>,
+        stream: sys::CUstream,
+        src: Vec<T>,
+    ) -> Result<CudaSlice<T>, result::DriverError> {
         let mut dst = unsafe { self.alloc(src.len()) }?;
-        self.htod_copy_into(src, &mut dst)?;
+        Self::htod_copy_into_on_stream(stream, src, &mut dst)?;
         Ok(dst)
     }
 
@@ -217,14 +226,18 @@ impl CudaDevice {
         src: Vec<T>,
         dst: &mut CudaSlice<T>,
     ) -> Result<(), result::DriverError> {
+        Self::htod_copy_into_on_stream(self.stream, src, dst)
+    }
+
+    pub fn htod_copy_into_on_stream<T: DeviceRepr + Unpin>(
+        stream: sys::CUstream,
+        src: Vec<T>,
+        dst: &mut CudaSlice<T>,
+    ) -> Result<(), result::DriverError> {
         assert_eq!(src.len(), dst.len());
         dst.host_buf = Some(Pin::new(src));
         unsafe {
-            result::memcpy_htod_async(
-                dst.cu_device_ptr,
-                dst.host_buf.as_ref().unwrap(),
-                self.stream,
-            )
+            result::memcpy_htod_async(dst.cu_device_ptr, dst.host_buf.as_ref().unwrap(), stream)
         }?;
         Ok(())
     }
@@ -278,9 +291,17 @@ impl CudaDevice {
         self: &Arc<Self>,
         src: &CudaSlice<T>,
     ) -> Result<Vec<T>, result::DriverError> {
+        Self::dtoh_sync_copy_on_stream(self.stream, src)
+    }
+
+    #[allow(clippy::uninit_vec)]
+    pub fn dtoh_sync_copy_on_stream<T: DeviceRepr>(
+        stream: sys::CUstream,
+        src: &CudaSlice<T>,
+    ) -> Result<Vec<T>, result::DriverError> {
         let mut dst = Vec::with_capacity(src.len());
         unsafe { dst.set_len(src.len()) };
-        self.dtoh_sync_copy_into(src, &mut dst)?;
+        Self::dtoh_sync_copy_into_on_stream(stream, src, &mut dst)?;
         Ok(dst)
     }
 
@@ -301,9 +322,17 @@ impl CudaDevice {
         src: &Src,
         dst: &mut [T],
     ) -> Result<(), result::DriverError> {
+        Self::dtoh_sync_copy_into_on_stream(self.stream, src, dst)
+    }
+
+    pub fn dtoh_sync_copy_into_on_stream<T: DeviceRepr, Src: DevicePtr<T>>(
+        stream: sys::CUstream,
+        src: &Src,
+        dst: &mut [T],
+    ) -> Result<(), result::DriverError> {
         assert_eq!(src.len(), dst.len());
-        unsafe { result::memcpy_dtoh_async(dst, *src.device_ptr(), self.stream) }?;
-        self.synchronize()
+        unsafe { result::memcpy_dtoh_async(dst, *src.device_ptr(), stream) }?;
+        unsafe { result::stream::synchronize(stream) }
     }
 
     /// Synchronously de-allocates `src` and converts it into it's host value.
