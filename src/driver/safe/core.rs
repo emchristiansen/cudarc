@@ -227,7 +227,7 @@ impl<T: Clone + Default + DeviceRepr + Unpin> TryFrom<CudaSlice<T>> for Vec<T> {
 #[derive(Debug)]
 pub(crate) struct CudaModule {
     pub(crate) cu_module: sys::CUmodule,
-    pub(crate) functions: BTreeMap<&'static str, sys::CUfunction>,
+    pub(crate) functions: BTreeMap<String, sys::CUfunction>,
 }
 
 unsafe impl Send for CudaModule {}
@@ -267,7 +267,7 @@ unsafe impl Sync for CudaFunction {}
 #[derive(Debug)]
 pub struct CudaStream {
     pub stream: sys::CUstream,
-    device: Arc<CudaDevice>,
+    pub device: Arc<CudaDevice>,
 }
 
 impl CudaDevice {
@@ -277,7 +277,7 @@ impl CudaDevice {
     ///
     /// This stream synchronizes in the following way:
     /// 1. On creation it adds a wait for any existing work on the default work stream to complete
-    /// 2. On drop it adds a wait for any existign work on Self to complete *to the default stream*.
+    /// 2. On drop it adds a wait for any existing work on Self to complete *to the default stream*.
     pub fn fork_default_stream(self: &Arc<Self>) -> Result<CudaStream, result::DriverError> {
         let stream = CudaStream {
             stream: result::stream::create(result::stream::StreamKind::NonBlocking)?,

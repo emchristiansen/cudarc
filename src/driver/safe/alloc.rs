@@ -2,6 +2,7 @@ use crate::driver::{result, sys};
 
 use super::core::{CudaDevice, CudaSlice, CudaView, CudaViewMut};
 use super::device_ptr::{DevicePtr, DevicePtrMut, DeviceSlice};
+use super::CudaStream;
 
 use std::{marker::Unpin, pin::Pin, sync::Arc, vec::Vec};
 
@@ -205,6 +206,16 @@ impl CudaDevice {
         Ok(dst)
     }
 
+    pub fn htod_copy_on_stream<T: Unpin + DeviceRepr>(
+        self: &Arc<Self>,
+        stream: sys::CUstream,
+        src: Vec<T>,
+    ) -> Result<CudaSlice<T>, result::DriverError> {
+        let mut dst = unsafe { self.alloc(src.len()) }?;
+        Self::htod_copy_into_on_stream(stream, src, &mut dst)?;
+        Ok(dst)
+    }
+
     /// Takes ownership of the host data and copies it to device data asynchronously.
     ///
     /// # Safety
@@ -217,14 +228,18 @@ impl CudaDevice {
         src: Vec<T>,
         dst: &mut CudaSlice<T>,
     ) -> Result<(), result::DriverError> {
+        Self::htod_copy_into_on_stream(self.stream, src, dst)
+    }
+
+    pub fn htod_copy_into_on_stream<T: DeviceRepr + Unpin>(
+        stream: sys::CUstream,
+        src: Vec<T>,
+        dst: &mut CudaSlice<T>,
+    ) -> Result<(), result::DriverError> {
         assert_eq!(src.len(), dst.len());
         dst.host_buf = Some(Pin::new(src));
         unsafe {
-            result::memcpy_htod_async(
-                dst.cu_device_ptr,
-                dst.host_buf.as_ref().unwrap(),
-                self.stream,
-            )
+            result::memcpy_htod_async(dst.cu_device_ptr, dst.host_buf.as_ref().unwrap(), stream)
         }?;
         Ok(())
     }

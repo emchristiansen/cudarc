@@ -11,14 +11,14 @@ use std::{collections::BTreeMap, sync::Arc};
 impl CudaDevice {
     /// Dynamically load a set of [crate::driver::CudaFunction] from a jit compiled ptx.
     ///
-    /// - `ptx` contains the compilex ptx
+    /// - `ptx` contains the compiled ptx
     /// - `module_name` is a unique identifier used to access the module later on with [CudaDevice::get_func()]
     /// - `func_names` is a slice of function names to load into the module during build.
     pub fn load_ptx(
-        self: &Arc<Self>,
+        &self,
         ptx: Ptx,
         module_name: &str,
-        func_names: &[&'static str],
+        func_names: &[&str],
     ) -> Result<(), result::DriverError> {
         let cu_module = match ptx.0 {
             PtxKind::Image(image) => unsafe {
@@ -34,8 +34,8 @@ impl CudaDevice {
             }
         }?;
         let mut functions = BTreeMap::new();
-        for &fn_name in func_names.iter() {
-            let fn_name_c = CString::new(fn_name).unwrap();
+        for fn_name in func_names.iter().map(|s| s.to_string()) {
+            let fn_name_c = CString::new(fn_name.clone()).unwrap();
             let cu_function = unsafe { result::module::get_function(cu_module, fn_name_c) }?;
             functions.insert(fn_name, cu_function);
         }
