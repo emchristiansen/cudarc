@@ -179,7 +179,7 @@ impl Drop for CudaDevice {
 #[derive(Debug)]
 pub struct CudaSlice<T> {
     pub(crate) cu_device_ptr: sys::CUdeviceptr,
-    pub(crate) len: usize,
+    pub len: usize,
     pub(crate) device: Arc<CudaDevice>,
     pub(crate) host_buf: Option<Pin<Vec<T>>>,
 }
