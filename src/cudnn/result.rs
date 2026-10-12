@@ -2,7 +2,7 @@
 
 use std::mem::MaybeUninit;
 
-use super::sys;
+use super::sys::{self};
 
 pub type CudnnResult<T> = Result<T, CudnnError>;
 
@@ -46,6 +46,8 @@ pub fn get_cudart_version() -> usize {
 
 /// Runs all *VersionCheck functions.
 pub fn version_check() -> Result<(), CudnnError> {
+    // This should be a cudnn version issue, not a cuda version issue.
+    #[cfg(feature = "cudnn-08009")]
     unsafe {
         sys::cudnnAdvInferVersionCheck().result()?;
         sys::cudnnAdvTrainVersionCheck().result()?;
@@ -53,6 +55,12 @@ pub fn version_check() -> Result<(), CudnnError> {
         sys::cudnnCnnTrainVersionCheck().result()?;
         sys::cudnnOpsInferVersionCheck().result()?;
         sys::cudnnOpsTrainVersionCheck().result()?;
+    }
+    #[cfg(any(feature = "cudnn-09010", feature = "cudnn-09021"))]
+    unsafe {
+        sys::cudnnAdvVersionCheck().result()?;
+        sys::cudnnCnnVersionCheck().result()?;
+        sys::cudnnOpsVersionCheck().result()?;
     }
     Ok(())
 }
@@ -188,6 +196,21 @@ pub unsafe fn set_filter4d_descriptor(
     sys::cudnnSetFilter4dDescriptor(filter_desc, data_type, format, k, c, h, w).result()
 }
 
+/// Sets data on a pre allocated filter descriptor. See [nvidia docs](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnSetFilterNdDescriptor)
+///
+/// # Safety
+/// `filter_desc` must be have been allocated with [create_filter_descriptor]
+/// and NOT already freed by [destroy_filter_descriptor].
+pub unsafe fn set_filternd_descriptor(
+    filter_desc: sys::cudnnFilterDescriptor_t,
+    data_type: sys::cudnnDataType_t,
+    format: sys::cudnnTensorFormat_t,
+    nb_dims: std::ffi::c_int,
+    filter_dims: *const std::ffi::c_int,
+) -> Result<(), CudnnError> {
+    sys::cudnnSetFilterNdDescriptor(filter_desc, data_type, format, nb_dims, filter_dims).result()
+}
+
 /// Destroys a filter descriptor. See [nvidia docs](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnDestroyFilterDescriptor)
 ///
 /// # Safety
@@ -232,6 +255,33 @@ pub unsafe fn set_convolution2d_descriptor(
         v,
         dilation_h,
         dilation_w,
+        mode,
+        compute_type,
+    )
+    .result()
+}
+
+/// Sets data on a conv descriptor. See [nvidia docs](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnSetConvolutionNdDescriptor)
+///
+/// # Safety
+/// `conv_desc` must have been allocated by [create_convolution_descriptor]
+/// and NOT freed by [destroy_convolution_descriptor].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn set_convolutionnd_descriptor(
+    conv_desc: sys::cudnnConvolutionDescriptor_t,
+    array_length: std::ffi::c_int,
+    pads: *const std::ffi::c_int,
+    filter_strides: *const std::ffi::c_int,
+    dilations: *const std::ffi::c_int,
+    mode: sys::cudnnConvolutionMode_t,
+    compute_type: sys::cudnnDataType_t,
+) -> Result<(), CudnnError> {
+    sys::cudnnSetConvolutionNdDescriptor(
+        conv_desc,
+        array_length,
+        pads,
+        filter_strides,
+        dilations,
         mode,
         compute_type,
     )
@@ -358,6 +408,53 @@ pub unsafe fn convolution_forward(
         work_space,
         work_space_size_in_bytes,
         beta,
+        y_desc,
+        y,
+    )
+    .result()
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn convolution_bias_activation_forward(
+    handle: sys::cudnnHandle_t,
+    alpha1: *const ::core::ffi::c_void,
+    x_desc: sys::cudnnTensorDescriptor_t,
+    x: *const ::core::ffi::c_void,
+    w_desc: sys::cudnnFilterDescriptor_t,
+    w: *const ::core::ffi::c_void,
+    conv_desc: sys::cudnnConvolutionDescriptor_t,
+    algo: sys::cudnnConvolutionFwdAlgo_t,
+    work_space: *mut ::core::ffi::c_void,
+    work_space_size_in_bytes: usize,
+    alpha2: *const ::core::ffi::c_void,
+    z_desc: sys::cudnnTensorDescriptor_t,
+    z: *const ::core::ffi::c_void,
+    bias_desc: sys::cudnnTensorDescriptor_t,
+    bias: *const ::core::ffi::c_void,
+    activation_desc: sys::cudnnActivationDescriptor_t,
+    y_desc: sys::cudnnTensorDescriptor_t,
+    y: *mut ::core::ffi::c_void,
+) -> Result<(), CudnnError> {
+    sys::cudnnConvolutionBiasActivationForward(
+        handle,
+        alpha1,
+        x_desc,
+        x,
+        w_desc,
+        w,
+        conv_desc,
+        algo,
+        work_space,
+        work_space_size_in_bytes,
+        alpha2,
+        z_desc,
+        z,
+        bias_desc,
+        bias,
+        activation_desc,
         y_desc,
         y,
     )
@@ -681,4 +778,108 @@ pub unsafe fn reduce_tensor(
         c,
     )
     .result()
+}
+
+pub fn create_pooling_descriptor() -> Result<sys::cudnnPoolingDescriptor_t, CudnnError> {
+    let mut desc = MaybeUninit::uninit();
+    unsafe {
+        sys::cudnnCreatePoolingDescriptor(desc.as_mut_ptr()).result()?;
+        Ok(desc.assume_init())
+    }
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+pub unsafe fn set_pooling_descriptor(
+    desc: sys::cudnnPoolingDescriptor_t,
+    mode: sys::cudnnPoolingMode_t,
+    nan_propagation: sys::cudnnNanPropagation_t,
+    nb_dims: std::ffi::c_int,
+    window_dims: &[std::ffi::c_int],
+    pads: &[std::ffi::c_int],
+    strides: &[std::ffi::c_int],
+) -> Result<(), CudnnError> {
+    sys::cudnnSetPoolingNdDescriptor(
+        desc,
+        mode,
+        nan_propagation,
+        nb_dims,
+        window_dims.as_ptr(),
+        pads.as_ptr(),
+        strides.as_ptr(),
+    )
+    .result()
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pooling_forward(
+    handle: sys::cudnnHandle_t,
+    pooling_desc: sys::cudnnPoolingDescriptor_t,
+    alpha: *const ::core::ffi::c_void,
+    x_desc: sys::cudnnTensorDescriptor_t,
+    x: *const ::core::ffi::c_void,
+    beta: *const ::core::ffi::c_void,
+    y_desc: sys::cudnnTensorDescriptor_t,
+    y: *mut ::core::ffi::c_void,
+) -> Result<(), CudnnError> {
+    sys::cudnnPoolingForward(handle, pooling_desc, alpha, x_desc, x, beta, y_desc, y).result()
+}
+
+pub fn create_activation_descriptor() -> Result<sys::cudnnActivationDescriptor_t, CudnnError> {
+    let mut desc = MaybeUninit::uninit();
+    unsafe {
+        sys::cudnnCreateActivationDescriptor(desc.as_mut_ptr()).result()?;
+        Ok(desc.assume_init())
+    }
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+pub unsafe fn set_activation_descriptor(
+    desc: sys::cudnnActivationDescriptor_t,
+    mode: sys::cudnnActivationMode_t,
+    nan_propagation: sys::cudnnNanPropagation_t,
+    coef: f64,
+) -> Result<(), CudnnError> {
+    sys::cudnnSetActivationDescriptor(desc, mode, nan_propagation, coef).result()
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn activation_forward(
+    handle: sys::cudnnHandle_t,
+    activation_desc: sys::cudnnActivationDescriptor_t,
+    alpha: *const ::core::ffi::c_void,
+    x_desc: sys::cudnnTensorDescriptor_t,
+    x: *const ::core::ffi::c_void,
+    beta: *const ::core::ffi::c_void,
+    y_desc: sys::cudnnTensorDescriptor_t,
+    y: *mut ::core::ffi::c_void,
+) -> Result<(), CudnnError> {
+    sys::cudnnActivationForward(handle, activation_desc, alpha, x_desc, x, beta, y_desc, y).result()
+}
+
+/// # Safety
+/// Make sure the handle is valid, all data are associated with the handle, and no pointers are null
+/// unless explicitly accepted by the underlying apis.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn softmax_forward(
+    handle: sys::cudnnHandle_t,
+    algo: sys::cudnnSoftmaxAlgorithm_t,
+    mode: sys::cudnnSoftmaxMode_t,
+    alpha: *const ::core::ffi::c_void,
+    x_desc: sys::cudnnTensorDescriptor_t,
+    x: *const ::core::ffi::c_void,
+    beta: *const ::core::ffi::c_void,
+    y_desc: sys::cudnnTensorDescriptor_t,
+    y: *mut ::core::ffi::c_void,
+) -> Result<(), CudnnError> {
+    sys::cudnnSoftmaxForward(handle, algo, mode, alpha, x_desc, x, beta, y_desc, y).result()
 }

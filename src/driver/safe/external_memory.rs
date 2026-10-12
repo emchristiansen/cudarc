@@ -1,56 +1,31 @@
-use core::{marker::PhantomData, mem::ManuallyDrop};
 use std::fs::File;
+use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{CudaDevice, DevicePtr, DeviceSlice};
+use super::{CudaContext, CudaEvent, CudaStream, DevicePtr, DeviceSlice, SyncOnDrop};
 use crate::driver::{result, sys, DriverError};
-
-impl CudaDevice {
-    /// Import external memory from a [`File`].
-    ///
-    /// # Safety
-    /// `size` must be the size of the external memory in bytes.
-    #[cfg(any(unix, windows))]
-    pub unsafe fn import_external_memory(
-        self: &Arc<Self>,
-        file: File,
-        size: u64,
-    ) -> Result<ExternalMemory, DriverError> {
-        #[cfg(unix)]
-        let external_memory = unsafe {
-            use std::os::fd::AsRawFd;
-            result::external_memory::import_external_memory_opaque_fd(file.as_raw_fd(), size)
-        }?;
-        #[cfg(windows)]
-        let external_memory = unsafe {
-            use std::os::windows::io::AsRawHandle;
-            result::external_memory::import_external_memory_opaque_win32(file.as_raw_handle(), size)
-        }?;
-        Ok(ExternalMemory {
-            external_memory,
-            size,
-            _device: self.clone(),
-            _file: ManuallyDrop::new(file),
-        })
-    }
-}
 
 /// An abstraction for imported external memory.
 ///
-/// This struct can be created via [`CudaDevice::import_external_memory`].
+/// This struct can be created via [`CudaContext::import_external_memory()`].
 /// The imported external memory will be destroyed when this struct is dropped.
 #[derive(Debug)]
 pub struct ExternalMemory {
     external_memory: sys::CUexternalMemory,
     size: u64,
-    _device: Arc<CudaDevice>,
+    ctx: Arc<CudaContext>,
     _file: ManuallyDrop<File>,
 }
 
 impl Drop for ExternalMemory {
     fn drop(&mut self) {
-        unsafe { result::external_memory::destroy_external_memory(self.external_memory) }.unwrap();
+        let ctx = &self.ctx;
+        ctx.record_err(ctx.bind_to_thread());
+
+        ctx.record_err(unsafe {
+            result::external_memory::destroy_external_memory(self.external_memory)
+        });
 
         // From [CUDA docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXTRES__INTEROP.html#group__CUDA__EXTRES__INTEROP_1g52aba3a7f780157d8ba12972b2481735),
         // when successfully importing UNIX file descriptor:
@@ -71,10 +46,43 @@ impl Drop for ExternalMemory {
     }
 }
 
+impl CudaContext {
+    /// Import external memory from a [`File`].
+    ///
+    /// # Safety
+    /// `size` must be the size of the external memory in bytes.
+    #[cfg(any(unix, windows))]
+    pub unsafe fn import_external_memory(
+        self: &Arc<Self>,
+        file: File,
+        size: u64,
+    ) -> Result<ExternalMemory, DriverError> {
+        self.bind_to_thread()?;
+
+        #[cfg(unix)]
+        let external_memory = unsafe {
+            use std::os::fd::AsRawFd;
+            result::external_memory::import_external_memory_opaque_fd(file.as_raw_fd(), size)
+        }?;
+        #[cfg(windows)]
+        let external_memory = unsafe {
+            use std::os::windows::io::AsRawHandle;
+            result::external_memory::import_external_memory_opaque_win32(file.as_raw_handle(), size)
+        }?;
+        Ok(ExternalMemory {
+            external_memory,
+            size,
+            ctx: self.clone(),
+            _file: ManuallyDrop::new(file),
+        })
+    }
+}
+
 impl ExternalMemory {
     /// Map the whole external memory to get mapped buffer.
-    pub fn map_all(&mut self) -> Result<MappedBuffer<'_>, DriverError> {
-        self.map_range(0..self.size as usize)
+    pub fn map_all(self) -> Result<MappedBuffer, DriverError> {
+        let size = self.size as usize;
+        self.map_range(0..size)
     }
 
     /// Map a range of the external memory to a mapped buffer.
@@ -86,7 +94,7 @@ impl ExternalMemory {
     /// # Panics
     /// This function will panic if the range is invalid,
     /// such as when the start or end is larger than the size.
-    pub fn map_range(&mut self, range: Range<usize>) -> Result<MappedBuffer<'_>, DriverError> {
+    pub fn map_range(self, range: Range<usize>) -> Result<MappedBuffer, DriverError> {
         assert!(range.start as u64 <= self.size);
         assert!(range.end as u64 <= self.size);
         let device_ptr = unsafe {
@@ -96,10 +104,14 @@ impl ExternalMemory {
                 range.len() as u64,
             )
         }?;
+        let event = self.ctx.new_event(None)?;
+        let stream = self.ctx.default_stream();
         Ok(MappedBuffer {
             device_ptr,
             len: range.len(),
-            _marker: PhantomData,
+            external_memory: self,
+            event,
+            stream,
         })
     }
 }
@@ -109,26 +121,41 @@ impl ExternalMemory {
 /// This struct can be created via [`ExternalMemory::map_range`] or [`ExternalMemory::map_all`].
 /// The underlying mapped buffer will be freed when this struct is dropped.
 #[derive(Debug)]
-pub struct MappedBuffer<'a> {
+pub struct MappedBuffer {
     device_ptr: sys::CUdeviceptr,
     len: usize,
-    _marker: PhantomData<&'a mut ExternalMemory>,
+    external_memory: ExternalMemory,
+    event: CudaEvent,
+    stream: Arc<CudaStream>,
 }
 
-impl Drop for MappedBuffer<'_> {
+impl Drop for MappedBuffer {
     fn drop(&mut self) {
-        unsafe { result::memory_free(self.device_ptr) }.unwrap()
+        let ctx = &self.external_memory.ctx;
+        ctx.record_err(ctx.bind_to_thread());
+        ctx.record_err(self.stream.wait(&self.event));
+        ctx.record_err(unsafe { result::memory_free(self.device_ptr) })
     }
 }
 
-impl DeviceSlice<u8> for MappedBuffer<'_> {
+impl DeviceSlice<u8> for MappedBuffer {
     fn len(&self) -> usize {
         self.len
     }
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 }
 
-impl DevicePtr<u8> for MappedBuffer<'_> {
-    fn device_ptr(&self) -> &sys::CUdeviceptr {
-        &self.device_ptr
+impl DevicePtr<u8> for MappedBuffer {
+    fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        // Since we only implement [DevicePtr] for this, and not [DevicePtrMut],
+        // this memory can never be written to, only read from. So we don't need
+        // to synchronize here at all.
+        // However, we still do need to record this read.
+        (
+            self.device_ptr,
+            SyncOnDrop::Record(Some((&self.event, stream))),
+        )
     }
 }

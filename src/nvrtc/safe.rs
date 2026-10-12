@@ -26,6 +26,46 @@ impl Ptx {
     pub fn from_src<S: Into<String>>(src: S) -> Self {
         Self(PtxKind::Src(src.into()))
     }
+
+    /// Creates a Ptx from binary CUBIN data.
+    pub fn from_binary(data: Vec<u8>) -> Self {
+        Self(PtxKind::Binary(data))
+    }
+
+    /// Get the compiled source as a string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Ptx was created from binary CUBIN data, as CUBIN cannot be
+    /// converted to a string representation.
+    pub fn to_src(&self) -> String {
+        match &self.0 {
+            PtxKind::Image(bytes) => unsafe { CStr::from_ptr(bytes.as_ptr()) }
+                .to_str()
+                .expect("Unable to convert bytes to str.")
+                .to_owned(),
+            PtxKind::Src(src) => src.clone(),
+            PtxKind::File(path) => {
+                std::fs::read_to_string(path).expect("Unable to read ptx from file.")
+            }
+            PtxKind::Binary(_) => {
+                panic!("Cannot convert binary CUBIN data to string. Use from_src() or from_file() for PTX data.")
+            }
+        }
+    }
+
+    /// If `self` is a compiled image (obtained using [compile_ptx] or [compile_ptx_with_opts]), get as bytes.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            PtxKind::Image(bytes) => unsafe {
+                Some(std::slice::from_raw_parts(
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                ))
+            },
+            _ => None,
+        }
+    }
 }
 
 impl<S: Into<String>> From<S> for Ptx {
@@ -42,8 +82,11 @@ pub(crate) enum PtxKind {
     /// Content of a pre compiled ptx file
     Src(String),
 
-    /// Path to a compiled ptx
+    /// Path to a compiled ptx or cubin file
     File(PathBuf),
+
+    /// Binary CUBIN data
+    Binary(Vec<u8>),
 }
 
 /// Calls [compile_ptx_with_opts] with no options. `src` is the source string
@@ -74,18 +117,32 @@ pub fn compile_ptx_with_opts<S: AsRef<str>>(
     src: S,
     opts: CompileOptions,
 ) -> Result<Ptx, CompileError> {
-    let prog = Program::create(src)?;
+    let prog = Program::create(src, opts.name.as_deref())?;
     prog.compile(opts)
 }
 
 pub(crate) struct Program {
     prog: sys::nvrtcProgram,
+
+    // Held in this struct to ensure they are not
+    // dropped until after the nvrtcProgram.
+    _src: CString,
+    _name: Option<CString>,
 }
 
 impl Program {
-    pub(crate) fn create<S: AsRef<str>>(src: S) -> Result<Self, CompileError> {
-        let prog = result::create_program(src).map_err(CompileError::CreationError)?;
-        Ok(Self { prog })
+    pub(crate) fn create<S: AsRef<str>>(src: S, name: Option<&str>) -> Result<Self, CompileError> {
+        let src = CString::new(src.as_ref().as_bytes())
+            .expect("program code cannot contain null terminators");
+        let name =
+            name.map(|s| CString::new(s).expect("program name cannot contain null terminators"));
+        let prog =
+            result::create_program(&src, name.as_deref()).map_err(CompileError::CreationError)?;
+        Ok(Self {
+            prog,
+            _src: src,
+            _name: name,
+        })
     }
 
     pub(crate) fn compile(self, opts: CompileOptions) -> Result<Ptx, CompileError> {
@@ -176,10 +233,12 @@ pub struct CompileOptions {
     pub prec_sqrt: Option<bool>,
     pub prec_div: Option<bool>,
     pub fmad: Option<bool>,
+    pub options: Vec<String>,
     pub use_fast_math: Option<bool>,
     pub maxrregcount: Option<usize>,
     pub include_paths: Vec<String>,
     pub arch: Option<&'static str>,
+    pub name: Option<String>,
 }
 
 impl CompileOptions {
@@ -216,6 +275,10 @@ impl CompileOptions {
 
         if let Some(arch) = self.arch {
             options.push(std::format!("--gpu-architecture={arch}"))
+        }
+
+        for option in self.options {
+            options.push(option);
         }
 
         options

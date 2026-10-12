@@ -4,7 +4,7 @@
 //! 1. Not generic: See [generate] for non-generic generation functions.
 //! 2. Generic: See [UniformFill], [NormalFill], and [LogNormalFill] for generic generation functions.
 
-use super::sys;
+use super::sys::{self};
 use std::mem::MaybeUninit;
 
 /// Wrapper around [sys::curandStatus_t].
@@ -62,6 +62,19 @@ pub unsafe fn set_seed(generator: sys::curandGenerator_t, seed: u64) -> Result<(
     sys::curandSetPseudoRandomGeneratorSeed(generator, seed).result()
 }
 
+/// Set the offset value of the pseudo-random number generator.
+///
+/// See [cuRAND docs](https://docs.nvidia.com/cuda/curand/group__HOST.html#group__HOST_1gb21ba987f85486e552797206451b0939)
+///
+/// # Safety
+/// The generator must be allocated and not already freed.
+pub unsafe fn set_offset(
+    generator: sys::curandGenerator_t,
+    offset: u64,
+) -> Result<(), CurandError> {
+    sys::curandSetGeneratorOffset(generator, offset).result()
+}
+
 /// Set the current stream for CURAND kernel launches.
 ///
 /// See [cuRAND docs](https://docs.nvidia.com/cuda/curand/group__HOST.html#group__HOST_1gc78c8d07c7acea4242e2a62bc41ff1f5)
@@ -89,7 +102,10 @@ pub unsafe fn destroy_generator(generator: sys::curandGenerator_t) -> Result<(),
 pub mod generate {
     //! Functions to generate different distributions.
 
-    use super::{sys, CurandError};
+    use super::{
+        sys::{self},
+        CurandError,
+    };
 
     /// Fills `out` with `num` f32 values in the range (0.0, 1.0].
     ///
@@ -134,6 +150,21 @@ pub mod generate {
         num: usize,
     ) -> Result<(), CurandError> {
         sys::curandGenerate(gen, out, num).result()
+    }
+
+    /// Fills `out` with `num` u64 values with all bits random.
+    ///
+    /// See [cuRAND docs](https://docs.nvidia.com/cuda/curand/group__HOST.html#group__HOST_1gd8e23d144e88b8e638139db05ff798b3)
+    ///
+    /// # Safety
+    /// 1. generator must have been allocated and not freed.
+    /// 2. `out` point to `num` values
+    pub unsafe fn uniform_u64(
+        gen: sys::curandGenerator_t,
+        out: *mut u64,
+        num: usize,
+    ) -> Result<(), CurandError> {
+        sys::curandGenerateLongLong(gen, out, num).result()
     }
 
     /// Fills `out` with `num` f32 values from a normal distribution
@@ -248,6 +279,12 @@ impl UniformFill<f64> for sys::curandGenerator_t {
 impl UniformFill<u32> for sys::curandGenerator_t {
     unsafe fn fill(self, out: *mut u32, num: usize) -> Result<(), CurandError> {
         generate::uniform_u32(self, out, num)
+    }
+}
+
+impl UniformFill<u64> for sys::curandGenerator_t {
+    unsafe fn fill(self, out: *mut u64, num: usize) -> Result<(), CurandError> {
+        generate::uniform_u64(self, out, num)
     }
 }
 

@@ -1,0 +1,852 @@
+use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result};
+use bindgen::Builder;
+
+mod download;
+mod extract;
+mod merge;
+mod version;
+
+use crate::version::Version;
+
+/// Cuda is split in various modules in cudarc.
+/// Those configs decide how to download and
+/// export bindings with bindgen. See [`ModuleConfig`].
+fn create_modules() -> Vec<ModuleConfig> {
+    macro_rules! filters_prefix {
+        ($p:literal) => {
+            Filters {
+                types: vec![concat!("^", $p, ".*")],
+                functions: vec![concat!("^", $p, ".*")],
+                vars: vec![concat!("^", $p, ".*")],
+            }
+        };
+    }
+    vec![
+        ModuleConfig {
+            cudarc_name: "runtime",
+            redist_name: "cuda_cudart",
+            allowlist: Filters {
+                types: vec!["^[Cc][Uu][Dd][Aa].*"],
+                functions: vec!["^[Cc][Uu][Dd][Aa].*"],
+                vars: vec!["^[Cc][Uu][Dd][Aa].*"],
+            },
+            blocklist: Filters {
+                // NOTE: See https://github.com/chelsea0x3b/cudarc/issues/397
+                functions: vec!["cudaDeviceGetNvSciSyncAttributes"],
+                ..Filters::none()
+            },
+            libs: vec!["cudart"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "driver",
+            redist_name: "cuda_cudart",
+            allowlist: Filters {
+                types: vec![
+                    "^CU.*",
+                    "^cuuint(32|64)_t",
+                    "^cudaError_enum",
+                    "^cu.*Complex$",
+                    "^cuda.*",
+                    "^libraryPropertyType.*",
+                ],
+                functions: vec!["^cu.*"],
+                vars: vec!["^CU.*"],
+            },
+            blocklist: Filters {
+                // NOTE: See https://github.com/chelsea0x3b/cudarc/issues/385
+                types: vec!["^cuCheckpoint.*"],
+                functions: vec!["^cuCheckpoint.*", "cuDeviceGetNvSciSyncAttributes"],
+                ..Filters::none()
+            },
+            libs: vec!["cuda", "nvcuda"],
+            bitflag_enums: vec![
+                "CUmemAllocationHandleType_enum",
+                "CUgraphInstantiate_flags_enum",
+            ],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cublas",
+            redist_name: "libcublas",
+            allowlist: filters_prefix!("cublas"),
+            blocklist: Filters {
+                functions: vec![
+                    // NOTE: see https://github.com/chelsea0x3b/cudarc/issues/489
+                    "cublasGetEmulationSpecialValuesSupport",
+                    "cublasGetFixedPointEmulationMantissaBitCountPointer",
+                    "cublasGetFixedPointEmulationMantissaBitOffset",
+                    "cublasGetFixedPointEmulationMantissaControl",
+                    "cublasGetFixedPointEmulationMaxMantissaBitCount",
+                    "cublasSetEmulationSpecialValuesSupport",
+                    "cublasSetFixedPointEmulationMantissaBitCountPointer",
+                    "cublasSetFixedPointEmulationMantissaBitOffset",
+                    "cublasSetFixedPointEmulationMantissaControl",
+                    "cublasSetFixedPointEmulationMaxMantissaBitCount",
+                ],
+                ..Filters::none()
+            },
+            libs: vec!["cublas"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cublaslt",
+            redist_name: "libcublas",
+            allowlist: filters_prefix!("cublasLt"),
+            blocklist: Filters {
+                functions: vec!["cublasLtDisableCpuInstructionsSetMask"],
+                ..Filters::none()
+            },
+            libs: vec!["cublasLt"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "curand",
+            redist_name: "libcurand",
+            allowlist: filters_prefix!("curand"),
+            blocklist: Filters {
+                functions: vec!["curandGenerateBinomial", "curandGenerateBinomialMethod"],
+                ..Filters::none()
+            },
+            libs: vec!["curand"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "nvrtc",
+            redist_name: "cuda_nvrtc",
+            allowlist: filters_prefix!("nvrtc"),
+            blocklist: Filters {
+                functions: vec![
+                    // NOTE: see https://github.com/chelsea0x3b/cudarc/pull/431
+                    "nvrtcGetPCHCreateStatus",
+                    "nvrtcGetPCHHeapSize",
+                    "nvrtcGetPCHHeapSizeRequired",
+                    "nvrtcSetFlowCallback",
+                    "nvrtcSetPCHHeapSize",
+                    // NOTE: see https://github.com/chelsea0x3b/cudarc/issues/490
+                    "nvrtcGetNVVM",
+                    "nvrtcGetNVVMSize",
+                ],
+                ..Filters::none()
+            },
+            libs: vec!["nvrtc"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cudnn",
+            redist_name: "cudnn",
+            allowlist: filters_prefix!("cudnn"),
+            libs: vec!["cudnn"],
+            feature_prefix: "cudnn",
+            lib_versions: vec![
+                Version::new(8, 9, 7),
+                Version::new(9, 10, 2),
+                Version::new(9, 21, 1),
+            ],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "nccl",
+            redist_name: "libnccl",
+            allowlist: filters_prefix!("nccl"),
+            libs: vec!["nccl"],
+            feature_prefix: "nccl",
+            lib_versions: vec![
+                Version::new(2, 22, 3),
+                Version::new(2, 24, 3),
+                Version::new(2, 25, 1),
+                Version::new(2, 26, 5),
+                Version::new(2, 27, 6),
+                Version::new(2, 28, 9),
+                Version::new(2, 29, 7),
+                Version::new(2, 30, 4),
+            ],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cusparse",
+            redist_name: "libcusparse",
+            allowlist: filters_prefix!("cusparse"),
+            blocklist: Filters {
+                functions: vec![
+                    "cusparseCbsric02_bufferSizeExt",
+                    "cusparseCbsrilu02_bufferSizeExt",
+                    "cusparseCbsrsm2_bufferSizeExt",
+                    "cusparseCbsrsv2_bufferSizeExt",
+                    "cusparseCcsr2gebsr_bufferSizeExt",
+                    "cusparseCcsric02_bufferSizeExt",
+                    "cusparseCcsrilu02_bufferSizeExt",
+                    "cusparseCgebsr2gebsc_bufferSizeExt",
+                    "cusparseCgebsr2gebsr_bufferSizeExt",
+                    "cusparseDbsric02_bufferSizeExt",
+                    "cusparseDbsrilu02_bufferSizeExt",
+                    "cusparseDbsrsm2_bufferSizeExt",
+                    "cusparseDbsrsv2_bufferSizeExt",
+                    "cusparseDcsr2gebsr_bufferSizeExt",
+                    "cusparseDcsric02_bufferSizeExt",
+                    "cusparseDcsrilu02_bufferSizeExt",
+                    "cusparseDgebsr2gebsc_bufferSizeExt",
+                    "cusparseDgebsr2gebsr_bufferSizeExt",
+                    "cusparseSbsric02_bufferSizeExt",
+                    "cusparseSbsrilu02_bufferSizeExt",
+                    "cusparseSbsrsm2_bufferSizeExt",
+                    "cusparseSbsrsv2_bufferSizeExt",
+                    "cusparseScsr2gebsr_bufferSizeExt",
+                    "cusparseScsric02_bufferSizeExt",
+                    "cusparseScsrilu02_bufferSizeExt",
+                    "cusparseSgebsr2gebsc_bufferSizeExt",
+                    "cusparseSgebsr2gebsr_bufferSizeExt",
+                    "cusparseXgebsr2csr",
+                    "cusparseZbsric02_bufferSizeExt",
+                    "cusparseZbsrilu02_bufferSizeExt",
+                    "cusparseZbsrsm2_bufferSizeExt",
+                    "cusparseZbsrsv2_bufferSizeExt",
+                    "cusparseZcsr2gebsr_bufferSizeExt",
+                    "cusparseZcsric02_bufferSizeExt",
+                    "cusparseZcsrilu02_bufferSizeExt",
+                    "cusparseZgebsr2gebsc_bufferSizeExt",
+                    "cusparseZgebsr2gebsr_bufferSizeExt",
+                ],
+                ..Filters::none()
+            },
+            libs: vec!["cusparse"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cusolver",
+            redist_name: "libcusolver",
+            allowlist: filters_prefix!("cusolver"),
+            blocklist: Filters {
+                types: vec!["^cusolverMg.*"],
+                functions: vec!["^cusolverMg.*", "^cusolverDnLogger.*"],
+                vars: vec!["^cusolverMg.*"],
+            },
+            libs: vec!["cusolver"],
+            // cusolverDn.h transitively includes cublas_v2.h
+            module_dependencies: vec!["cublas", "cusparse"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cusolvermg",
+            redist_name: "libcusolver",
+            allowlist: filters_prefix!("cusolverMg"),
+            libs: vec!["cusolverMg"],
+            // cusolverMg.h transitively includes cublas_v2.h
+            module_dependencies: vec!["cublas", "cusparse"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cufile",
+            redist_name: "libcufile",
+            allowlist: Filters {
+                types: vec!["^[Cc][Uu][Ff][Ii][Ll][Ee].*"],
+                functions: vec!["^cuFile.*"],
+                ..Filters::none()
+            },
+            libs: vec!["cufile"],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "nvtx",
+            redist_name: "cuda_nvtx",
+            allowlist: filters_prefix!("nvtx"),
+            blocklist: Filters {
+                functions: vec!["nvtxInitialize"],
+                ..Filters::none()
+            },
+            libs: vec!["nvToolsExt"],
+            clang_args: vec!["-DNVTX_NO_IMPL=0", "-DNVTX_DECLSPEC="],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cupti",
+            redist_name: "cuda_cupti",
+            allowlist: Filters {
+                types: vec![
+                    // CUPTI types:
+                    "^[Cc][Uu][Pp][Tt][Ii].*",
+                    // Types from the generated_cuda(_meta / runtime_api_meta).h
+                    // headers. These help dissect data representing function arguments
+                    // of CUDA functions in the CUPTI Callback API.
+                    "^[Cc][Uu][Dd][Aa].*_params.*",
+                    "^[Cc][Uu].*_params.*",
+                    // Types that are obsolete but still used in CUPTI.
+                    "CUDA_ARRAY_DESCRIPTOR_v1_st",
+                    "CUDA_ARRAY_DESCRIPTOR_v1",
+                    "CUDA_ARRAY3D_DESCRIPTOR_v1_st",
+                    "CUDA_ARRAY3D_DESCRIPTOR_v1",
+                    "CUDA_MEMCPY2D_v1_st",
+                    "CUDA_MEMCPY2D_v1",
+                    "CUDA_MEMCPY3D_v1_st",
+                    "CUDA_MEMCPY3D_v1",
+                    "CUdeviceptr_v1",
+                ],
+                functions: vec!["^cupti.*", "^CUpti.*"],
+                vars: vec!["^[Cc][Uu][Pp][Tt][Ii].*"],
+            },
+            allowlist_recursively: false,
+            blocklist: Filters {
+                types: vec![
+                    // For cuda-11040, the meta headers seem to include some osbolete
+                    // types for which the definitions are missing because they are not
+                    // included through any cupti headers, but only exist in a CUDA
+                    // source, block these:
+                    "cudaSignalExternalSemaphoresAsync_ptsz_v10000_params_st",
+                    "cudaSignalExternalSemaphoresAsync_ptsz_v10000_params",
+                    "cudaSignalExternalSemaphoresAsync_v10000_params_st",
+                    "cudaSignalExternalSemaphoresAsync_v10000_params",
+                    "cudaWaitExternalSemaphoresAsync_ptsz_v10000_params_st",
+                    "cudaWaitExternalSemaphoresAsync_ptsz_v10000_params",
+                    "cudaWaitExternalSemaphoresAsync_v10000_params_st",
+                    "cudaWaitExternalSemaphoresAsync_v10000_params",
+                ],
+                ..Filters::none()
+            },
+            libs: vec!["cupti"],
+            clang_args: vec!["-I../src/cupti/sys/"],
+            raw_lines: vec!["use crate::driver::sys::*;", "use crate::runtime::sys::*;"],
+            constified_enums: vec!["CUpti_.*_STRUCT_SIZES"],
+            prepend_enum_names: false,
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cutensor",
+            redist_name: "libcutensor",
+            allowlist: filters_prefix!("cutensor"),
+            libs: vec!["cutensor"],
+            feature_prefix: "cutensor",
+            lib_versions: vec![
+                Version::new(2, 3, 1),
+                Version::new(2, 4, 1),
+                Version::new(2, 5, 0),
+                Version::new(2, 6, 0),
+            ],
+            ..Default::default()
+        },
+        ModuleConfig {
+            cudarc_name: "cufft",
+            redist_name: "libcufft",
+            allowlist: filters_prefix!("cufft"),
+            libs: vec!["cufft"],
+            min_cuda_version: Some(Version::new(12, 0, 0)),
+            ..Default::default()
+        },
+    ]
+}
+
+#[derive(Debug)]
+struct ModuleConfig {
+    /// Name of corresponding module in cudarc
+    cudarc_name: &'static str,
+    /// The name of the library within cuda/redist
+    redist_name: &'static str,
+    /// The various filter used in bindgen to select the symbols we re-expose
+    allowlist: Filters,
+    blocklist: Filters,
+    /// The various names used to look for symbols
+    /// Those names are only used with the `dynamic-loading`
+    /// feature.
+    libs: Vec<&'static str>,
+    /// Arguments passed directly to clang.
+    clang_args: Vec<&'static str>,
+    /// Whether to recursively add types from allowlist items. This can be set to false
+    /// in order to prevent duplicate definitions for headers that include other headers
+    /// for which bindings are also generated.
+    allowlist_recursively: bool,
+    /// Lines of code to add at the beginning of the generated bindings.
+    raw_lines: Vec<&'static str>,
+    /// Minimum CUDA version required for this module. If None, all versions are supported.
+    min_cuda_version: Option<Version>,
+    /// cudarc module names whose archive include dirs must be on the clang include path.
+    /// Modules with dependencies are processed in a second wave, after all independent
+    /// modules have been downloaded, extracted, and had bindings generated.
+    module_dependencies: Vec<&'static str>,
+    /// Cargo feature prefix for this module (e.g. "cuda", "nccl", "cudnn", "cutensor").
+    feature_prefix: &'static str,
+    /// Library versions for library-versioned modules. Empty means CUDA-version axis.
+    lib_versions: Vec<Version>,
+    /// C enum names that are bitflags (values are powers of 2 meant to be OR-ed together).
+    /// These are generated as transparent newtypes instead of Rust enums so that bitwise OR
+    /// is well-defined, and `BitOr`/`BitOrAssign` impls are emitted for them.
+    bitflag_enums: Vec<&'static str>,
+    /// Enums to translate into various constants.
+    constified_enums: Vec<&'static str>,
+    /// Whether to prepend enum names to their variants
+    prepend_enum_names: bool,
+}
+
+impl Default for ModuleConfig {
+    fn default() -> Self {
+        Self {
+            cudarc_name: "",
+            redist_name: "",
+            allowlist: Filters::none(),
+            blocklist: Filters::none(),
+            libs: vec![],
+            clang_args: vec![],
+            allowlist_recursively: true,
+            raw_lines: vec![],
+            min_cuda_version: None,
+            module_dependencies: vec![],
+            feature_prefix: "cuda",
+            lib_versions: vec![],
+            bitflag_enums: vec![],
+            constified_enums: vec![],
+            prepend_enum_names: true,
+        }
+    }
+}
+
+impl ModuleConfig {
+    /// Returns true if this module supports the given CUDA version.
+    fn supports_cuda_version(&self, cuda_version: Version) -> bool {
+        match self.min_cuda_version {
+            None => true,
+            Some(min_version) => cuda_version >= min_version,
+        }
+    }
+
+    fn run_bindgen(
+        &self,
+        version: Version,
+        archive_directory: &Path,
+        primary_archives: &[PathBuf],
+    ) -> Result<()> {
+        let sysdir = Path::new(".")
+            .join("out")
+            .join(self.cudarc_name)
+            .join("sys");
+        fs::create_dir_all(&sysdir)
+            .context(format!("Failed to create directory {}", sysdir.display()))?;
+
+        let linked_dir = sysdir.join("linked");
+        fs::create_dir_all(&linked_dir).context(format!(
+            "Failed to create directory {}",
+            linked_dir.display()
+        ))?;
+
+        let outfilename = linked_dir.join(format!("sys_{version}.rs"));
+
+        // Generate linked bindings using bindgen library
+        let mut builder = Builder::default()
+            .default_enum_style(bindgen::EnumVariation::Rust {
+                non_exhaustive: false,
+            })
+            .derive_default(false)
+            .derive_eq(true)
+            .derive_hash(true)
+            .derive_ord(true)
+            .generate_comments(false)
+            .layout_tests(false)
+            .use_core();
+
+        for &arg in self.clang_args.iter() {
+            builder = builder.clang_arg(arg);
+        }
+
+        for filter_name in self.allowlist.types.iter() {
+            builder = builder.allowlist_type(filter_name);
+        }
+        for filter_name in self.allowlist.vars.iter() {
+            builder = builder.allowlist_var(filter_name);
+        }
+        for filter_name in self.allowlist.functions.iter() {
+            builder = builder.allowlist_function(filter_name);
+        }
+        builder = builder.allowlist_recursively(self.allowlist_recursively);
+
+        for filter_name in self.blocklist.types.iter() {
+            builder = builder.blocklist_type(filter_name);
+        }
+        for filter_name in self.blocklist.vars.iter() {
+            builder = builder.blocklist_var(filter_name);
+        }
+        for filter_name in self.blocklist.functions.iter() {
+            builder = builder.blocklist_function(filter_name);
+        }
+
+        for &raw_line in self.raw_lines.iter() {
+            builder = builder.raw_line(raw_line);
+        }
+
+        for &n in self.bitflag_enums.iter() {
+            builder = builder.bitfield_enum(n);
+        }
+
+        for &en in self.constified_enums.iter() {
+            builder = builder.constified_enum(en);
+        }
+
+        let parent_sysdir = Path::new("..")
+            .join("src")
+            .join(self.cudarc_name)
+            .join("sys");
+        let wrapper_h = parent_sysdir.join("wrapper.h");
+        let cuda_directory = archive_directory.join("include");
+        let primary_includes: Vec<_> = primary_archives.iter().map(|c| c.join("include")).collect();
+        log::debug!("Include directories {}", cuda_directory.display());
+        log::debug!(
+            "Include primary directories {:?}",
+            primary_includes
+                .iter()
+                .map(|p| p.display())
+                .collect::<Vec<_>>()
+        );
+        builder = builder
+            .header(wrapper_h.to_string_lossy())
+            .clang_arg(format!("-I{}", cuda_directory.display()))
+            .prepend_enum_name(self.prepend_enum_names)
+            // For cuda profiler which has a very simple consistent API
+            .clang_arg(format!(
+                "-I{}",
+                std::env::current_dir()
+                    .expect("Current directory")
+                    .join("include")
+                    .display()
+            ));
+        for include in primary_includes {
+            builder = builder.clang_arg(format!("-I{}", include.display()));
+        }
+
+        let bindings = builder.generate().context(format!(
+            "Failed to generate bindings for {}",
+            wrapper_h.display()
+        ))?;
+
+        bindings.write_to_file(&outfilename).context(format!(
+            "Failed to write bindings to {}",
+            outfilename.display()
+        ))?;
+        log::debug!("Wrote linked bindings to {}", outfilename.display());
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+/// Bindgen filters
+struct Filters {
+    types: Vec<&'static str>,
+    functions: Vec<&'static str>,
+    vars: Vec<&'static str>,
+}
+
+impl Filters {
+    fn none() -> Self {
+        Self {
+            types: vec![],
+            functions: vec![],
+            vars: vec![],
+        }
+    }
+}
+
+/// Downloads, unpacks and generate bindings for all modules.
+fn create_bindings(modules: &[ModuleConfig], cuda_versions: &[Version]) -> Result<()> {
+    let downloads_dir = std::env::temp_dir().join("cudarc").join("bindings");
+    fs::create_dir_all(&downloads_dir).context("Failed to create downloads directory")?;
+
+    let multi_progress = MultiProgress::new();
+
+    // Phase A: download primary archives for all versions in parallel.
+    // These are done upfront so module tasks don't race on the shared primary archive paths.
+    let pb = multi_progress.add(ProgressBar::new(cuda_versions.len() as u64));
+    pb.set_style(ProgressStyle::default_bar().template("primary archives {bar} {pos}/{len}")?);
+    let primary_archives = cuda_versions
+        .par_iter()
+        .map(|cuda_version| {
+            // cuda_cudart provides cuda.h / cuda_runtime.h, which virtually every module
+            // transitively includes. It must be a primary archive so all parallel module
+            // tasks have those headers on their include path.
+            let names = match (cuda_version.major, cuda_version.minor) {
+                // CCCL was renamed from `cuda_cccl` to `cccl` in the 13.3 redistrib manifest.
+                (13, 3..) => vec!["cuda_nvcc", "cccl", "cuda_crt", "cuda_cudart"],
+                (13, _) => vec!["cuda_nvcc", "cuda_cccl", "cuda_crt", "cuda_cudart"],
+                (12, _) => vec!["cuda_nvcc", "cuda_cccl", "cuda_cudart"],
+                _ => vec!["cuda_nvcc", "cuda_cudart"],
+            };
+            let mut archives = vec![];
+            for name in names {
+                archives.push(get_archive(
+                    cuda_version,
+                    name,
+                    "primary",
+                    &downloads_dir,
+                    &multi_progress,
+                )?);
+            }
+            pb.inc(1);
+            Ok((*cuda_version, archives))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    pb.finish();
+    drop(pb);
+
+    // Phase B: CUDA-versioned modules, processed in dependency order.
+    let cuda_tasks: Vec<(Version, &ModuleConfig)> = cuda_versions
+        .iter()
+        .flat_map(|&v| modules.iter().map(move |m| (v, m)))
+        .filter(|(v, m)| m.lib_versions.is_empty() && m.supports_cuda_version(*v))
+        .collect();
+
+    let mut archive_dir_map: HashMap<(Version, &str), PathBuf> = HashMap::new();
+    let mut remaining: Vec<(Version, &ModuleConfig)> = cuda_tasks;
+
+    while !remaining.is_empty() {
+        let (ready, not_ready): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|(v, m)| {
+            m.module_dependencies
+                .iter()
+                .all(|dep| archive_dir_map.contains_key(&(*v, *dep)))
+        });
+        assert!(!ready.is_empty(), "dependency cycle detected");
+
+        let pb = multi_progress.add(ProgressBar::new(ready.len() as u64));
+        pb.set_style(ProgressStyle::default_bar().template("cuda {bar} {pos}/{len} ({eta})")?);
+        let results = ready
+            .par_iter()
+            .map(|(cuda_version, module)| {
+                let mut includes = primary_archives[cuda_version].clone();
+                for dep_name in &module.module_dependencies {
+                    if let Some(dep_dir) = archive_dir_map.get(&(*cuda_version, *dep_name)) {
+                        includes.push(dep_dir.clone());
+                    }
+                }
+                let archive_dir = get_archive(
+                    cuda_version,
+                    module.redist_name,
+                    module.cudarc_name,
+                    &downloads_dir,
+                    &multi_progress,
+                )?;
+                module.run_bindgen(*cuda_version, &archive_dir, &includes)?;
+
+                pb.inc(1);
+                Ok(((*cuda_version, module.cudarc_name), archive_dir))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        pb.finish();
+        drop(pb);
+        archive_dir_map.extend(results);
+        remaining = not_ready;
+    }
+
+    // Phase C: library-versioned modules (NCCL, cuDNN, cuTENSOR).
+    let lib_tasks: Vec<(&ModuleConfig, Version)> = modules
+        .iter()
+        .filter(|m| !m.lib_versions.is_empty())
+        .flat_map(|m| m.lib_versions.iter().map(move |&v| (m, v)))
+        .collect();
+
+    let pb = multi_progress.add(ProgressBar::new(lib_tasks.len() as u64));
+    pb.set_style(ProgressStyle::default_bar().template("downstream {bar} {pos}/{len} ({eta})")?);
+    lib_tasks
+        .into_par_iter()
+        .map(|(module, lib_version)| {
+            let (archive_dir, cuda_version) = if module.cudarc_name == "nccl" {
+                get_nccl_archive(lib_version, module, &downloads_dir, &multi_progress)?
+            } else {
+                get_cuda_major_archive(lib_version, module, &downloads_dir, &multi_progress)?
+            };
+            module.run_bindgen(lib_version, &archive_dir, &primary_archives[&cuda_version])?;
+            pb.inc(1);
+            Ok(())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    pb.finish();
+    drop(pb);
+
+    Ok(())
+}
+
+fn get_archive(
+    cuda_version: &Version,
+    cuda_name: &str,
+    module_name: &str,
+    downloads_dir: &Path,
+    multi_progress: &MultiProgress,
+) -> Result<PathBuf> {
+    let url = "https://developer.download.nvidia.com/compute/cuda/redist/";
+    let data = download::cuda_redist(*cuda_version, url, downloads_dir, multi_progress)?;
+    let lib = &data[cuda_name]["linux-x86_64"];
+    let relative_path = lib["relative_path"].as_str().unwrap();
+    let out_path = downloads_dir
+        .join(module_name)
+        .join(Path::new(relative_path).file_name().unwrap());
+    download::to_file_with_checksum(
+        &format!("{url}/{relative_path}"),
+        &out_path,
+        lib["sha256"].as_str().unwrap(),
+        multi_progress,
+    )?;
+    extract::extract_archive(&out_path, multi_progress)
+}
+
+fn get_nccl_archive(
+    lib_version: Version,
+    module: &ModuleConfig,
+    downloads_dir: &Path,
+    multi_progress: &MultiProgress,
+) -> Result<(PathBuf, Version)> {
+    let base_url = "https://developer.download.nvidia.com/compute/redist/nccl";
+    let full_version = lib_version.to_string();
+
+    let output_dir = downloads_dir.join(module.cudarc_name);
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let cached_prefix = format!("nccl_{full_version}-1+cuda");
+    if let Some(existing) = fs::read_dir(&output_dir)?.flatten().find_map(|e| {
+        let path = e.path();
+        let name = path.file_name()?.to_str()?;
+        if path.is_dir() && name.starts_with(&cached_prefix) {
+            // Parse cuda major/minor from directory name e.g. "nccl_2.30.4-1+cuda13.2_x86_64"
+            let after_cuda = name.strip_prefix(&cached_prefix)?;
+            let cuda_ver = after_cuda.split('_').next()?;
+            let (maj_str, min_str) = cuda_ver.split_once('.')?;
+            let cuda_major: u32 = maj_str.parse().ok()?;
+            let cuda_minor: u32 = min_str.parse().ok()?;
+            Some((path, Version::new(cuda_major, cuda_minor, 0)))
+        } else {
+            None
+        }
+    }) {
+        Ok(existing)
+    } else {
+        let pairings = download::nccl_cuda_pairings(lib_version, base_url).context(format!(
+            "Failed to discover CUDA pairings for NCCL {full_version}"
+        ))?;
+        let cuda = pairings[0];
+
+        let filename = format!(
+            "nccl_{full_version}-1+cuda{}.{}_x86_64.txz",
+            cuda.major, cuda.minor
+        );
+        let full_url = format!("{base_url}/v{full_version}/{filename}");
+        let out_path = output_dir.join(&filename);
+        download::to_file(&full_url, &out_path, multi_progress)?;
+        let archive_dir = extract::extract_archive(&out_path, multi_progress)?;
+        Ok((archive_dir, Version::new(cuda.major, cuda.minor, 0)))
+    }
+}
+
+fn get_cuda_major_archive(
+    lib_version: Version,
+    module: &ModuleConfig,
+    downloads_dir: &Path,
+    multi_progress: &MultiProgress,
+) -> Result<(PathBuf, Version)> {
+    let url = match module.cudarc_name {
+        "cudnn" => "https://developer.download.nvidia.com/compute/cudnn/redist/",
+        "cutensor" => "https://developer.download.nvidia.com/compute/cutensor/redist/",
+        other => panic!("Unknown lib-versioned redist module: {other}"),
+    };
+
+    let data = download::cuda_redist(lib_version, url, downloads_dir, multi_progress)?;
+    let variants = &data[module.redist_name]["linux-x86_64"];
+
+    // Pick the newest CUDA variant available in the manifest.
+    let (cuda_major, cuda_key) = variants
+        .as_object()
+        .context(format!(
+            "Expected linux-x86_64 entry for {} {lib_version}",
+            module.redist_name
+        ))?
+        .keys()
+        .filter_map(|k| Some((k.strip_prefix("cuda")?.parse::<u32>().ok()?, k.as_str())))
+        .max_by_key(|&(n, _)| n)
+        .context(format!(
+            "No CUDA variants found for {} {lib_version}",
+            module.redist_name
+        ))?;
+
+    let lib = &variants[cuda_key];
+    let relative_path = lib["relative_path"].as_str().unwrap();
+    let out_path = downloads_dir
+        .join(module.cudarc_name)
+        .join(Path::new(relative_path).file_name().unwrap());
+    download::to_file_with_checksum(
+        &format!("{url}/{relative_path}"),
+        &out_path,
+        lib["sha256"].as_str().unwrap(),
+        multi_progress,
+    )?;
+    let archive_dir = extract::extract_archive(&out_path, multi_progress)?;
+    let cuda_version = CUDA_VERSIONS
+        .iter()
+        .filter(|v| v.major == cuda_major)
+        .cloned()
+        .max()
+        .unwrap();
+    Ok((archive_dir, cuda_version))
+}
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Generating the bindings from scratch takes a long
+    /// time, but even if every archive is there too
+    /// because we have to check Nvidia's website for updates
+    /// Using this flag will skip that steps if you know you bindings
+    /// exist and are up to date.
+    #[arg(long, action)]
+    skip_bindings: bool,
+
+    /// Restrict to a single CUDA version, e.g. "12.8.0".
+    #[arg(long, action)]
+    cuda_version: Option<Version>,
+
+    /// Specify a single target to generate bindings for.
+    #[arg(long, action)]
+    target: Option<String>,
+}
+
+const CUDA_VERSIONS: &[Version] = &[
+    Version::new(11, 4, 0),
+    Version::new(11, 5, 0),
+    Version::new(11, 6, 0),
+    Version::new(11, 7, 0),
+    Version::new(11, 8, 0),
+    Version::new(12, 0, 0),
+    Version::new(12, 1, 0),
+    Version::new(12, 2, 0),
+    Version::new(12, 3, 0),
+    Version::new(12, 4, 0),
+    Version::new(12, 5, 0),
+    Version::new(12, 6, 0),
+    Version::new(12, 8, 0),
+    Version::new(12, 9, 0),
+    Version::new(13, 0, 0),
+    Version::new(13, 1, 0),
+    Version::new(13, 2, 0),
+    Version::new(13, 3, 0),
+    Version::new(13, 4, 0),
+];
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let mut modules = create_modules();
+    if let Some(target) = args.target {
+        modules.retain(|m| m.cudarc_name.contains(&target));
+    }
+
+    let mut cuda_versions: Vec<Version> = CUDA_VERSIONS.to_vec();
+    if let Some(version) = args.cuda_version {
+        cuda_versions.retain(|&v| v == version);
+    }
+
+    if !args.skip_bindings {
+        create_bindings(&modules, &cuda_versions)?;
+    }
+    merge::merge_bindings(&modules)?;
+    Ok(())
+}

@@ -1,4 +1,4 @@
-use super::sys;
+use super::sys::{self};
 use core::ffi::{c_int, c_longlong, c_void};
 use core::mem::MaybeUninit;
 
@@ -135,7 +135,29 @@ pub unsafe fn hgemm(
     c: *mut half::f16,
     ldc: c_int,
 ) -> Result<(), CublasError> {
-    super::half::cublasHgemm(
+    // NOTE: for some reason cublasHgemm is only included in header files if using c++. Therefore it
+    // is not included in the bindgen exports. So we manually link to the library & load the symbol here.
+    static LIB: std::sync::OnceLock<libloading::Library> = std::sync::OnceLock::new();
+    let lib = LIB
+        .get_or_init(|| libloading::Library::new(libloading::library_filename("cublas")).unwrap());
+    #[allow(non_snake_case)]
+    let f: unsafe extern "C" fn(
+        handle: sys::cublasHandle_t,
+        transa: sys::cublasOperation_t,
+        transb: sys::cublasOperation_t,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const half::f16,
+        A: *const half::f16,
+        lda: c_int,
+        B: *const half::f16,
+        ldb: c_int,
+        beta: *const half::f16,
+        C: *mut half::f16,
+        ldc: c_int,
+    ) -> sys::cublasStatus_t = lib.get(b"cublasHgemm\0").map(|sym| *sym).unwrap();
+    f(
         handle, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
     )
     .result()
@@ -233,7 +255,36 @@ pub unsafe fn hgemm_strided_batched(
     stride_c: c_longlong,
     batch_size: c_int,
 ) -> Result<(), CublasError> {
-    super::half::cublasHgemmStridedBatched(
+    // NOTE: for some reason cublasHgemm is only included in header files if using c++. Therefore it
+    // is not included in the bindgen exports. So we manually link to the library & load the symbol here.
+    static LIB: std::sync::OnceLock<libloading::Library> = std::sync::OnceLock::new();
+    let lib = LIB
+        .get_or_init(|| libloading::Library::new(libloading::library_filename("cublas")).unwrap());
+    #[allow(non_snake_case)]
+    let f: unsafe extern "C" fn(
+        handle: sys::cublasHandle_t,
+        transa: sys::cublasOperation_t,
+        transb: sys::cublasOperation_t,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const half::f16,
+        A: *const half::f16,
+        lda: c_int,
+        strideA: c_longlong,
+        B: *const half::f16,
+        ldb: c_int,
+        strideB: c_longlong,
+        beta: *const half::f16,
+        C: *mut half::f16,
+        ldc: c_int,
+        strideC: c_longlong,
+        batchCount: c_int,
+    ) -> sys::cublasStatus_t = lib
+        .get(b"cublasHgemmStridedBatched\0")
+        .map(|sym| *sym)
+        .unwrap();
+    f(
         handle, transa, transb, m, n, k, alpha, a, lda, stride_a, b, ldb, stride_b, beta, c, ldc,
         stride_c, batch_size,
     )
@@ -426,4 +477,40 @@ pub unsafe fn gemm_strided_batched_ex(
         algo,
     )
     .result()
+}
+
+/// Single precision sum of abosolute values. See
+/// [nvidia docs](https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-asum)
+///
+/// # Safety
+///
+/// - `x` must be valid device pointers that have not been freed.
+/// - `result` can be a pointer to host memory, but must be not null.
+/// - `n * incx` must be less than the size of `x`.
+pub unsafe fn sasum(
+    handle: sys::cublasHandle_t,
+    n: c_int,
+    x: *const f32,
+    incx: c_int,
+    result: *mut f32,
+) -> Result<(), CublasError> {
+    sys::cublasSasum_v2(handle, n, x, incx, result).result()
+}
+
+/// Double precision sum of abosolute values. See
+/// [nvidia docs](https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-asum)
+///
+/// # Safety
+///
+/// - `x` must be valid device pointers that have not been freed.
+/// - `result` can be a pointer to host memory, but must be not null.
+/// - `n * incx` must be less than the size of `x`.
+pub unsafe fn dasum(
+    handle: sys::cublasHandle_t,
+    n: c_int,
+    x: *const f64,
+    incx: c_int,
+    result: *mut f64,
+) -> Result<(), CublasError> {
+    sys::cublasDasum_v2(handle, n, x, incx, result).result()
 }
