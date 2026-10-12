@@ -6,47 +6,67 @@
 
 Checkout cudarc on [crates.io](https://crates.io/crates/cudarc) and [docs.rs](https://docs.rs/cudarc/latest/cudarc/).
 
-Safe abstractions over:
-1. [CUDA driver API](https://docs.nvidia.com/cuda/cuda-driver-api/index.html)
-2. [NVRTC API](https://docs.nvidia.com/cuda/nvrtc/index.html)
-3. [cuRAND API](https://docs.nvidia.com/cuda/curand/index.html)
-4. [cuBLAS API](https://docs.nvidia.com/cuda/cublas/index.html)
+**Contributions welcome!**
 
-**Pre-alpha state**, expect breaking changes and not all cuda functions
-contain a safe wrapper. **Contributions welcome for any that aren't included!**
+Safe CUDA wrappers for:
 
-# Design
+| library | dynamic load | dynamic link | static link |
+| --- | --- | --- | --- |
+| [CUDA driver](https://docs.nvidia.com/cuda/cuda-driver-api/index.html) | ✅ | ✅ | N/A |
+| [NVRTC](https://docs.nvidia.com/cuda/nvrtc/index.html) | ✅ | ✅ | ✅ |
+| [cuRAND](https://docs.nvidia.com/cuda/curand/index.html) | ✅ | ✅ | ✅ |
+| [cuBLAS](https://docs.nvidia.com/cuda/cublas/index.html) | ✅ | ✅ | ✅ |
+| [cuBLASLt](https://docs.nvidia.com/cuda/cublas/#using-the-cublaslt-api) | ✅ | ✅ | ✅ |
+| [NCCL](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/) | ✅ | ✅ | ✅ |
+| [cuDNN](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html) | ✅ | ✅ | ✅ |
+| [cuSPARSE](https://docs.nvidia.com/cuda/cusparse/) | ✅ | ✅ | ✅ |
+| [cuSOLVER](https://docs.nvidia.com/cuda/cusolver/) | ✅ | ✅ | N/A |
+| [cuFILE](https://docs.nvidia.com/gpudirect-storage/api-reference-guide/index.html#introduction) | ✅ | ✅ | ✅ |
+| [CUPTI](https://docs.nvidia.com/cupti/) | ✅ | ✅ | ✅ |
+| [nvtx](https://nvidia.github.io/NVTX/) | ✅ | ✅ | N/A |
+| [cuFFT](https://docs.nvidia.com/cuda/cufft/index.html) | ✅ | ❌ | ❌ |
 
-Goals are:
-1. As safe as possible (there will still be a lot of unsafe due to ffi & async)
-2. As ergonomic as possible
-3. Allow mixing of high level `safe` apis, with low level `sys` apis
+CUDA Versions supported (choose with `-F cuda-<version>`, like `cuda-13010`):
+- 11.4-11.8
+- 12.0-12.9
+- 13.0-13.4
 
-To that end there are three levels to each wrapper (by default the safe api is exported):
-```rust
-use cudarc::driver::{safe, result, sys};
-use cudarc::nvrtc::{safe, result, sys};
-use cudarc::cublas::{safe, result, sys};
-use cudarc::curand::{safe, result, sys};
-```
+CUDNN versions supported (choose with `-F cudnn-<version>`, like `cudnn-09021`):
+- 8.9.7
+- 9.10.2
+- 9.21.1
 
-where:
-1. `sys` is the raw ffi apis generated with bindgen
-2. `result` is a very small wrapper around sys to return `Result` from each function
-3. `safe` is a wrapper around result/sys to provide safe abstractions
+NCCL versions supported (choose with `-F nccl-<version>`, like `nccl-02023`):
+- 2.22-2.30
 
-*Heavily recommend sticking with safe APIs*
+# Configuring CUDA version
 
-# API Preview
+Select cuda version with one of:
+- `-F cuda-version-from-build-system`: At build time will get the cuda toolkit version using `nvcc`
+    - `-F fallback-latest`: can be used to control behavior if this fails. default is not enabled, which will cause the build
+      script to panic. if `-F fallback-latest` is enabled, we will use the highest bindings we have.
+- `-F cuda-<major>0<minor>0` to build for a specific version of cuda
+
+# Configuring linking
+
+By default we use `-F dynamic-loading`, which will not require any libraries to be present at build time.
+
+You can also enable `-F dynamic-linking` or `-F static-linking` for your use case.
+
+# Getting started
 
 It's easy to create a new device and transfer data to the gpu:
 
 ```rust
-let dev = cudarc::driver::CudaDevice::new(0)?;
+// Get a stream for GPU 0
+let ctx = cudarc::driver::CudaContext::new(0)?;
+let stream = ctx.default_stream();
 
-// allocate buffers
-let inp = dev.htod_copy(vec![1.0f32; 100])?;
-let mut out = dev.alloc_zeros::<f32>(100)?;
+// copy a rust slice to the device
+let inp = stream.clone_htod(&[1.0f32; 100])?;
+
+// or allocate directly
+let mut out = stream.alloc_zeros::<f32>(100)?;
 ```
 
 You can also use the nvrtc api to compile kernels at runtime:
@@ -60,25 +80,51 @@ extern \"C\" __global__ void sin_kernel(float *out, const float *inp, const size
     }
 }")?;
 
-// and dynamically load it into the device
-dev.load_ptx(ptx, "my_module", &["sin_kernel"])?;
+// Dynamically load it into the device
+let module = ctx.load_module(ptx)?;
+let sin_kernel = module.load_function("sin_kernel")?;
 ```
 
-`cudarc` provides a very simple interface to launch kernels, tuples
-are the arguments!
+`cudarc` provides a very simple interface to launch kernels using a builder pattern to specify kernel arguments:
 
 ```rust
-let sin_kernel = dev.get_func("my_module", "sin_kernel").unwrap();
-let cfg = LaunchConfig::for_num_elems(100);
-unsafe { sin_kernel.launch(cfg, (&mut out, &inp, 100usize)) }?;
+let mut builder = stream.launch_builder(&sin_kernel);
+builder.arg(&mut out);
+builder.arg(&inp);
+builder.arg(&100usize);
+unsafe { builder.launch(LaunchConfig::for_num_elems(100)) }?;
 ```
 
 And of course it's easy to copy things back to host after you're done:
 
 ```rust
-let out_host: Vec<f32> = dev.dtoh_sync_copy(&out)?;
+let out_host: Vec<f32> = stream.clone_dtoh(&out)?;
 assert_eq!(out_host, [1.0; 100].map(f32::sin));
 ```
+
+# Design
+
+Goals are:
+1. As safe as possible (there will still be a lot of unsafe due to ffi & async)
+2. As ergonomic as possible
+3. Allow mixing of high level `safe` apis, with low level `sys` apis
+
+To that end there are three levels to each wrapper (by default the safe api is exported):
+```rust
+use cudarc::driver::{safe, result, sys};
+use cudarc::nvrtc::{safe, result, sys};
+use cudarc::cublas::{safe, result, sys};
+use cudarc::cublaslt::{safe, result, sys};
+use cudarc::curand::{safe, result, sys};
+use cudarc::nccl::{safe, result, sys};
+```
+
+where:
+1. `sys` is the raw ffi apis generated with bindgen
+2. `result` is a very small wrapper around sys to return `Result` from each function
+3. `safe` is a wrapper around result/sys to provide safe abstractions
+
+*Heavily recommend sticking with safe APIs*
 
 # License
 

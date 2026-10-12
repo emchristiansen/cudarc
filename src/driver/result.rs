@@ -8,12 +8,12 @@
 //! because mixing the two is confusing and even more unsafe.
 //!
 //! This module also groups functions into sub-modules
-//! to make naming easier. For example [sys::cuStreamCreate()]
+//! to make naming easier. For example `sys::cuStreamCreate()`
 //! turns into [stream::create()], where [stream] is a module.
 
-use super::sys;
+use super::sys::{self};
 use core::ffi::{c_uchar, c_uint, c_void, CStr};
-use std::mem::{size_of, MaybeUninit};
+use std::mem::MaybeUninit;
 
 /// Wrapper around [sys::CUresult]. See
 /// nvidia's [CUresult docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TYPES.html#group__CUDA__TYPES_1gc6c391505e117393cc2558fff6bfc2e9)
@@ -56,11 +56,18 @@ impl DriverError {
 
 impl std::fmt::Debug for DriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let err_str = self.error_string().unwrap();
-        f.debug_tuple("DriverError")
-            .field(&self.0)
-            .field(&err_str)
-            .finish()
+        match self.error_string() {
+            Ok(err_str) => f
+                .debug_tuple("DriverError")
+                .field(&self.0)
+                .field(&err_str)
+                .finish(),
+            Err(_) => f
+                .debug_tuple("DriverError")
+                .field(&self.0)
+                .field(&"<Failure when calling cuGetErrorString()>")
+                .finish(),
+        }
     }
 }
 
@@ -87,9 +94,15 @@ pub mod device {
     //!
     //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE)
 
-    use super::{sys, DriverError};
-    use core::ffi::c_int;
-    use std::mem::MaybeUninit;
+    use super::{
+        sys::{self},
+        DriverError,
+    };
+    use std::{
+        ffi::{c_int, CStr},
+        mem::MaybeUninit,
+        string::String,
+    };
 
     /// Get a device for a specific ordinal.
     /// See [cuDeviceGet() docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g8bdd1cc7201304b01357b8034f6587cb).
@@ -122,6 +135,304 @@ pub mod device {
         sys::cuDeviceTotalMem_v2(bytes.as_mut_ptr(), dev).result()?;
         Ok(bytes.assume_init())
     }
+
+    /// Get an attribute of a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g8c6e2c7b5c7c8b7e6f7f4c2b7f6d9c5d)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get].
+    pub unsafe fn get_attribute(
+        dev: sys::CUdevice,
+        attrib: sys::CUdevice_attribute,
+    ) -> Result<i32, DriverError> {
+        let mut value = MaybeUninit::uninit();
+        sys::cuDeviceGetAttribute(value.as_mut_ptr(), attrib, dev).result()?;
+        Ok(value.assume_init())
+    }
+
+    /// Get name of the device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1gef75aa30df95446a845f2a7b9fffbb7f)
+    pub fn get_name(dev: sys::CUdevice) -> Result<String, DriverError> {
+        const BUF_SIZE: usize = 128;
+        let mut buf = [0u8; BUF_SIZE];
+        unsafe {
+            sys::cuDeviceGetName(buf.as_mut_ptr() as _, BUF_SIZE as _, dev).result()?;
+        }
+        let name = CStr::from_bytes_until_nul(&buf).expect("No null byte was present");
+        Ok(String::from_utf8_lossy(name.to_bytes()).into())
+    }
+
+    pub fn get_uuid(dev: sys::CUdevice) -> Result<sys::CUuuid, DriverError> {
+        let id: sys::CUuuid;
+        unsafe {
+            let mut uuid = MaybeUninit::uninit();
+            #[cfg(not(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            )))]
+            sys::cuDeviceGetUuid(uuid.as_mut_ptr(), dev).result()?;
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            ))]
+            sys::cuDeviceGetUuid_v2(uuid.as_mut_ptr(), dev).result()?;
+            id = uuid.assume_init();
+        }
+        Ok(id)
+    }
+
+    /// Get the default memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g2170a6e24f7e596854f0c48e1e98120e)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get].
+    pub unsafe fn get_default_mem_pool(
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Get the current memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1gccf6a0d72cf1cf1b1e0c127f053e9cb5)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get].
+    pub unsafe fn get_mem_pool(dev: sys::CUdevice) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuDeviceGetMemPool(pool.as_mut_ptr(), dev).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Set the memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g79369dcf089d772d11b5c3ccb05e7c21)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get]. Pool must be valid.
+    pub unsafe fn set_mem_pool(
+        dev: sys::CUdevice,
+        pool: sys::CUmemoryPool,
+    ) -> Result<(), DriverError> {
+        sys::cuDeviceSetMemPool(dev, pool).result()
+    }
+}
+
+pub mod function {
+    use super::sys::{self, CUfunc_cache_enum, CUfunction_attribute_enum};
+    use std::mem::MaybeUninit;
+
+    /// Gets a specific attribute of a CUDA function.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g5e92a1b0d8d1b82cb00dcfb2de15961b)
+    ///
+    /// # Safety
+    /// Function must exist.
+    pub unsafe fn get_function_attribute(
+        f: sys::CUfunction,
+        attribute: CUfunction_attribute_enum,
+    ) -> Result<i32, super::DriverError> {
+        let mut value = MaybeUninit::uninit();
+        unsafe {
+            sys::cuFuncGetAttribute(value.as_mut_ptr(), attribute, f).result()?;
+            Ok(value.assume_init())
+        }
+    }
+
+    /// Sets the specific attribute of a cuda function.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g317e77d2657abf915fd9ed03e75f3eb0)
+    ///
+    /// # Safety
+    /// Function must exist.
+    pub unsafe fn set_function_attribute(
+        f: sys::CUfunction,
+        attribute: CUfunction_attribute_enum,
+        value: i32,
+    ) -> Result<(), super::DriverError> {
+        unsafe {
+            sys::cuFuncSetAttribute(f, attribute, value).result()?;
+        }
+
+        Ok(())
+    }
+
+    /// Sets the cache config of a CUDA function.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g6699ca1943ac2655effa0d571b2f4f15)
+    ///
+    /// # Safety
+    /// Function must exist.
+    pub unsafe fn set_function_cache_config(
+        f: sys::CUfunction,
+        attribute: CUfunc_cache_enum,
+    ) -> Result<(), super::DriverError> {
+        unsafe {
+            sys::cuFuncSetCacheConfig(f, attribute).result()?;
+        }
+
+        Ok(())
+    }
+}
+
+pub mod occupancy {
+
+    use core::{
+        ffi::{c_int, c_uint},
+        mem::MaybeUninit,
+    };
+
+    use super::{
+        sys::{self},
+        DriverError,
+    };
+
+    /// Returns dynamic shared memory available per block when launching numBlocks blocks on SM.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__OCCUPANCY.html#group__CUDA__OCCUPANCY_1gae02af6a9df9e1bbd51941af631bce69)
+    ///
+    /// # Safety
+    /// Function must exist.
+    pub unsafe fn available_dynamic_shared_mem_per_block(
+        f: sys::CUfunction,
+        num_blocks: c_int,
+        block_size: c_int,
+    ) -> Result<usize, DriverError> {
+        let mut dynamic_smem_size = MaybeUninit::uninit();
+        unsafe {
+            sys::cuOccupancyAvailableDynamicSMemPerBlock(
+                dynamic_smem_size.as_mut_ptr(),
+                f,
+                num_blocks,
+                block_size,
+            )
+            .result()?;
+        }
+        Ok(dynamic_smem_size.assume_init())
+    }
+
+    /// Returns occupancy of a function.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__OCCUPANCY.html#group__CUDA__OCCUPANCY_1gcc6e1094d05cba2cee17fe33ddd04a98)
+    ///
+    /// # Safety
+    /// Function must exist.
+    pub unsafe fn max_active_block_per_multiprocessor(
+        f: sys::CUfunction,
+        block_size: c_int,
+        dynamic_smem_size: usize,
+    ) -> Result<i32, DriverError> {
+        let mut num_blocks = MaybeUninit::uninit();
+        unsafe {
+            sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                num_blocks.as_mut_ptr(),
+                f,
+                block_size,
+                dynamic_smem_size,
+            )
+            .result()?;
+        }
+        Ok(num_blocks.assume_init())
+    }
+
+    /// Returns occupancy of a function.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__OCCUPANCY.html#group__CUDA__OCCUPANCY_1g8f1da4d4983e5c3025447665423ae2c2)
+    ///
+    /// # Safety
+    /// Function must exist. No invalid flags.
+    pub unsafe fn max_active_block_per_multiprocessor_with_flags(
+        f: sys::CUfunction,
+        block_size: c_int,
+        dynamic_smem_size: usize,
+        flags: c_uint,
+    ) -> Result<i32, DriverError> {
+        let mut num_blocks = MaybeUninit::uninit();
+        unsafe {
+            sys::cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+                num_blocks.as_mut_ptr(),
+                f,
+                block_size,
+                dynamic_smem_size,
+                flags,
+            )
+            .result()?;
+        }
+        Ok(num_blocks.assume_init())
+    }
+
+    /// Suggest a launch configuration with reasonable occupancy.
+    ///
+    /// Returns (min_grid_size, block_size)
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__OCCUPANCY.html#group__CUDA__OCCUPANCY_1gf179c4ab78962a8468e41c3f57851f03)
+    ///
+    /// # Safety
+    /// Function must exist and the shared memory function must be correct.  No invalid flags.
+    pub unsafe fn max_potential_block_size(
+        f: sys::CUfunction,
+        block_size_to_dynamic_smem_size: sys::CUoccupancyB2DSize,
+        dynamic_smem_size: usize,
+        block_size_limit: c_int,
+    ) -> Result<(i32, i32), DriverError> {
+        let mut min_grid_size = MaybeUninit::uninit();
+        let mut block_size = MaybeUninit::uninit();
+        unsafe {
+            sys::cuOccupancyMaxPotentialBlockSize(
+                min_grid_size.as_mut_ptr(),
+                block_size.as_mut_ptr(),
+                f,
+                block_size_to_dynamic_smem_size,
+                dynamic_smem_size,
+                block_size_limit,
+            )
+            .result()?;
+        }
+        Ok((min_grid_size.assume_init(), block_size.assume_init()))
+    }
+
+    /// Suggest a launch configuration with reasonable occupancy.
+    ///
+    /// Returns (min_grid_size, block_size)
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__OCCUPANCY.html#group__CUDA__OCCUPANCY_1g04c0bb65630f82d9b99a5ca0203ee5aa)
+    ///
+    /// # Safety
+    /// Function must exist and the shared memory function must be correct.  No invalid flags.
+    pub unsafe fn max_potential_block_size_with_flags(
+        f: sys::CUfunction,
+        block_size_to_dynamic_smem_size: sys::CUoccupancyB2DSize,
+        dynamic_smem_size: usize,
+        block_size_limit: c_int,
+        flags: c_uint,
+    ) -> Result<(i32, i32), DriverError> {
+        let mut min_grid_size = MaybeUninit::uninit();
+        let mut block_size = MaybeUninit::uninit();
+        unsafe {
+            sys::cuOccupancyMaxPotentialBlockSizeWithFlags(
+                min_grid_size.as_mut_ptr(),
+                block_size.as_mut_ptr(),
+                f,
+                block_size_to_dynamic_smem_size,
+                dynamic_smem_size,
+                block_size_limit,
+                flags,
+            )
+            .result()?;
+        }
+        Ok((min_grid_size.assume_init(), block_size.assume_init()))
+    }
 }
 
 pub mod primary_ctx {
@@ -129,7 +440,10 @@ pub mod primary_ctx {
     //!
     //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__PRIMARY__CTX.html#group__CUDA__PRIMARY__CTX)
 
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
     use std::mem::MaybeUninit;
 
     /// Creates a primary context on the device and pushes it onto the primary context stack.
@@ -163,8 +477,70 @@ pub mod ctx {
     //!
     //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX)
 
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
     use std::mem::MaybeUninit;
+
+    /// Creates a new non-primary CUDA context using `cuCtxCreate_v3`.
+    ///
+    /// Available on CUDA 11.04 through 12.090.
+    ///
+    /// # Safety
+    ///
+    /// `dev` must be a valid device returned from [`super::device::get`].
+    #[cfg(any(
+        feature = "cuda-11040",
+        feature = "cuda-11050",
+        feature = "cuda-11060",
+        feature = "cuda-11070",
+        feature = "cuda-11080",
+        feature = "cuda-12000",
+        feature = "cuda-12010",
+        feature = "cuda-12020",
+        feature = "cuda-12030",
+        feature = "cuda-12040",
+        feature = "cuda-12050",
+        feature = "cuda-12060",
+        feature = "cuda-12080",
+        feature = "cuda-12090"
+    ))]
+    pub unsafe fn create_v3(
+        flags: ::core::ffi::c_uint,
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUcontext, DriverError> {
+        let mut ctx = MaybeUninit::uninit();
+        sys::cuCtxCreate_v3(ctx.as_mut_ptr(), std::ptr::null_mut(), 0, flags, dev).result()?;
+        Ok(ctx.assume_init())
+    }
+
+    /// Creates a new non-primary CUDA context using `cuCtxCreate_v4`.
+    ///
+    /// Available on CUDA 12.050+. Supports CiG (CUDA in Graphics) parameters
+    /// via `ctxCreateParams`.
+    ///
+    /// # Safety
+    ///
+    /// - `dev` must be a valid device returned from [`super::device::get`].
+    /// - If `ctx_create_params` is not null, it must point to a valid `CUctxCreateParams`.
+    #[cfg(any(
+        feature = "cuda-12050",
+        feature = "cuda-12060",
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010"
+    ))]
+    pub unsafe fn create_v4(
+        ctx_create_params: *mut sys::CUctxCreateParams,
+        flags: ::core::ffi::c_uint,
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUcontext, DriverError> {
+        let mut ctx = MaybeUninit::uninit();
+        sys::cuCtxCreate_v4(ctx.as_mut_ptr(), ctx_create_params, flags, dev).result()?;
+        Ok(ctx.assume_init())
+    }
 
     /// Binds the specified CUDA context to the calling CPU thread.
     ///
@@ -194,6 +570,60 @@ pub mod ctx {
             }
         }
     }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g66655c37602c8628eae3e40c82619f1e)
+    #[cfg(not(any(
+        feature = "cuda-11040",
+        feature = "cuda-11050",
+        feature = "cuda-11060",
+        feature = "cuda-11070",
+        feature = "cuda-11080",
+        feature = "cuda-12000"
+    )))]
+    pub fn set_flags(flags: sys::CUctx_flags) -> Result<(), DriverError> {
+        unsafe { sys::cuCtxSetFlags(flags as u32).result() }
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g7a54725f28d34b8c6299f0c6ca579616)
+    pub fn synchronize() -> Result<(), DriverError> {
+        unsafe { sys::cuCtxSynchronize() }.result()
+    }
+
+    /// Gets the value of a context limit.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g9f2d47d1745752aa16da4f8d6b7f6f06)
+    pub fn get_limit(limit: sys::CUlimit) -> Result<usize, DriverError> {
+        let mut value = MaybeUninit::uninit();
+        unsafe {
+            sys::cuCtxGetLimit(value.as_mut_ptr(), limit).result()?;
+            Ok(value.assume_init())
+        }
+    }
+
+    /// Sets the value of a context limit.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1gf9496524a98e2ee1896d4b97d4c7ef32)
+    pub fn set_limit(limit: sys::CUlimit, value: usize) -> Result<(), DriverError> {
+        unsafe { sys::cuCtxSetLimit(limit, value).result() }
+    }
+
+    /// Gets the cache configuration preference.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g40b6b141698f76b6bc8f4d3b1f0d85e7)
+    pub fn get_cache_config() -> Result<sys::CUfunc_cache, DriverError> {
+        let mut config = MaybeUninit::uninit();
+        unsafe {
+            sys::cuCtxGetCacheConfig(config.as_mut_ptr()).result()?;
+            Ok(config.assume_init())
+        }
+    }
+
+    /// Sets the cache configuration preference.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g54699acb1e6b97eee1535e59a738229a)
+    pub fn set_cache_config(config: sys::CUfunc_cache) -> Result<(), DriverError> {
+        unsafe { sys::cuCtxSetCacheConfig(config).result() }
+    }
 }
 
 pub mod stream {
@@ -201,7 +631,10 @@ pub mod stream {
     //!
     //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM).
 
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
     use std::mem::MaybeUninit;
 
     /// The kind of stream to initialize.
@@ -247,6 +680,44 @@ pub mod stream {
         }
     }
 
+    /// Creates a stream with the specified kind and priority.
+    ///
+    /// Lower numerical values indicate higher priority. Use [`get_priority_range`]
+    /// to query the valid range for the current context.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g95c1a8c7c3dacb13091692dd9c7f7471)
+    pub fn create_with_priority(
+        kind: StreamKind,
+        priority: i32,
+    ) -> Result<sys::CUstream, DriverError> {
+        let mut stream = MaybeUninit::uninit();
+        unsafe {
+            sys::cuStreamCreateWithPriority(stream.as_mut_ptr(), kind.flags() as u32, priority)
+                .result()?;
+            Ok(stream.assume_init())
+        }
+    }
+
+    /// Queries the range of stream priorities for the current context.
+    ///
+    /// Returns `(least_priority, greatest_priority)` matching the CUDA driver
+    /// API parameter order. Note that in CUDA, numerically **smaller** values
+    /// mean **higher** priority, so `greatest_priority <= least_priority`.
+    /// For example, a return value of `(0, -5)` means priority -5 is the
+    /// highest and 0 is the lowest.
+    ///
+    /// If the device does not support stream priorities, both values will be 0.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g137920ab61a71be6ce67f32ba4f72354)
+    pub fn get_priority_range() -> Result<(i32, i32), DriverError> {
+        let mut least = MaybeUninit::uninit();
+        let mut greatest = MaybeUninit::uninit();
+        unsafe {
+            sys::cuCtxGetStreamPriorityRange(least.as_mut_ptr(), greatest.as_mut_ptr()).result()?;
+            Ok((least.assume_init(), greatest.assume_init()))
+        }
+    }
+
     /// Wait until a stream's tasks are completed.
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g15e49dd91ec15991eb7c0a741beb7dad)
@@ -284,6 +755,64 @@ pub mod stream {
     ) -> Result<(), DriverError> {
         sys::cuStreamWaitEvent(stream, event, flags as u32).result()
     }
+
+    /// Attach managed memory to a stream.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g6e468d680e263e7eba02a56643c50533)
+    ///
+    /// # Safety
+    /// See the cuda docs, there are a lot of considerations for this one.
+    /// > Accessing memory on the device from streams that are not associated with it will produce undefined results. No error checking is performed by the Unified Memory system to ensure that kernels launched into other streams do not access this region.
+    pub unsafe fn attach_mem_async(
+        stream: sys::CUstream,
+        dptr: sys::CUdeviceptr,
+        num_bytes: usize,
+        flags: sys::CUmemAttach_flags,
+    ) -> Result<(), DriverError> {
+        sys::cuStreamAttachMemAsync(stream, dptr, num_bytes, flags as u32).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1gab95a78143bae7f21eebb978f91e7f3f)
+    ///
+    /// # Safety
+    /// See docs, it's really unsafe ya'll.
+    pub unsafe fn launch_host_function(
+        stream: sys::CUstream,
+        func: unsafe extern "C" fn(*mut ::core::ffi::c_void),
+        arg: *mut std::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        sys::cuLaunchHostFunc(stream, Some(func), arg).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g767167da0bbf07157dc20b6c258a2143)
+    /// # Safety
+    /// Stream must be valid
+    pub unsafe fn begin_capture(
+        stream: sys::CUstream,
+        mode: sys::CUstreamCaptureMode,
+    ) -> Result<(), DriverError> {
+        sys::cuStreamBeginCapture_v2(stream, mode).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g03dab8b2ba76b00718955177a929970c)
+    /// # Safety
+    /// Stream must be valid
+    pub unsafe fn end_capture(stream: sys::CUstream) -> Result<sys::CUgraph, DriverError> {
+        let mut graph = MaybeUninit::uninit();
+        sys::cuStreamEndCapture(stream, graph.as_mut_ptr()).result()?;
+        Ok(graph.assume_init())
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g37823c49206e3704ae23c7ad78560bca)
+    /// # Safety
+    /// Stream must be valid
+    pub unsafe fn is_capturing(
+        stream: sys::CUstream,
+    ) -> Result<sys::CUstreamCaptureStatus, DriverError> {
+        let mut status = MaybeUninit::uninit();
+        sys::cuStreamIsCapturing(stream, status.as_mut_ptr()).result()?;
+        Ok(status.assume_init())
+    }
 }
 
 /// Allocates memory with stream ordered semantics.
@@ -303,6 +832,99 @@ pub unsafe fn malloc_async(
     Ok(dev_ptr.assume_init())
 }
 
+/// Allocates memory
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1gb82d2a09844a58dd9e744dc31e8aa467)
+///
+/// # Safety
+/// 1. The memory return by this is unset, which may be invalid for `T`.
+pub unsafe fn malloc_sync(num_bytes: usize) -> Result<sys::CUdeviceptr, DriverError> {
+    let mut dev_ptr = MaybeUninit::uninit();
+    sys::cuMemAlloc_v2(dev_ptr.as_mut_ptr(), num_bytes).result()?;
+    Ok(dev_ptr.assume_init())
+}
+
+/// Allocates managed memory.
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1gb347ded34dc326af404aa02af5388a32)
+///
+/// # Safety
+/// 1. The memory return by this is unset, which may be invalid for `T`.
+pub unsafe fn malloc_managed(
+    num_bytes: usize,
+    flags: sys::CUmemAttach_flags,
+) -> Result<sys::CUdeviceptr, DriverError> {
+    let mut dev_ptr = MaybeUninit::uninit();
+    sys::cuMemAllocManaged(dev_ptr.as_mut_ptr(), num_bytes, flags as u32).result()?;
+    Ok(dev_ptr.assume_init())
+}
+
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g572ca4011bfcb25034888a14d4e035b9)
+/// # Safety
+/// 1. The memory return by this is unset, which may be invalid for `T`.
+pub unsafe fn malloc_host(num_bytes: usize, flags: c_uint) -> Result<*mut c_void, DriverError> {
+    let mut host_ptr = MaybeUninit::uninit();
+    sys::cuMemHostAlloc(host_ptr.as_mut_ptr(), num_bytes, flags).result()?;
+    Ok(host_ptr.assume_init())
+}
+
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g62e0fdbe181dab6b1c90fa1a51c7b92c)
+/// # Safety
+/// 1. `host_ptr` must have been returned by [malloc_host]
+/// 2. `host_ptr` should not be null.
+pub unsafe fn free_host(host_ptr: *mut c_void) -> Result<(), DriverError> {
+    sys::cuMemFreeHost(host_ptr).result()
+}
+
+/// Advise about the usage of a given memory range.
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__UNIFIED.html#group__CUDA__UNIFIED_1g27608c857a9254789c13f3e3b72029e2)
+/// **Only available in 12.2+.
+///
+/// # Safety
+/// 1. Memory must have been allocated by [malloc_managed()]
+/// 2. num_bytes must be the amount of bytes passed to [malloc_managed()]
+#[cfg(not(any(
+    feature = "cuda-11040",
+    feature = "cuda-11050",
+    feature = "cuda-11060",
+    feature = "cuda-11070",
+    feature = "cuda-11080",
+    feature = "cuda-12000",
+    feature = "cuda-12010"
+)))]
+pub unsafe fn mem_advise(
+    dptr: sys::CUdeviceptr,
+    num_bytes: usize,
+    advice: sys::CUmem_advise,
+    location: sys::CUmemLocation,
+) -> Result<(), DriverError> {
+    sys::cuMemAdvise_v2(dptr, num_bytes, advice, location).result()
+}
+
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__UNIFIED.html#group__CUDA__UNIFIED_1gfe94f8b7fb56291ebcea44261aa4cb84)
+/// **Only available in 12.2+.
+///
+/// # Safety
+/// 1. The dptr/num_bytes must be allocated by [malloc_managed()] and must be the exact same memory range.
+#[cfg(not(any(
+    feature = "cuda-11040",
+    feature = "cuda-11050",
+    feature = "cuda-11060",
+    feature = "cuda-11070",
+    feature = "cuda-11080",
+    feature = "cuda-12000",
+    feature = "cuda-12010"
+)))]
+pub unsafe fn mem_prefetch_async(
+    dptr: sys::CUdeviceptr,
+    num_bytes: usize,
+    location: sys::CUmemLocation,
+    stream: sys::CUstream,
+) -> Result<(), DriverError> {
+    sys::cuMemPrefetchAsync_v2(dptr, num_bytes, location, 0, stream).result()
+}
+
 /// Frees memory with stream ordered semantics.
 ///
 /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g41acf4131f672a2a75cd93d3241f10cf)
@@ -313,6 +935,16 @@ pub unsafe fn malloc_async(
 /// 3. The memory should not have been freed already (double free)
 pub unsafe fn free_async(dptr: sys::CUdeviceptr, stream: sys::CUstream) -> Result<(), DriverError> {
     sys::cuMemFreeAsync(dptr, stream).result()
+}
+
+/// Allocates memory
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g89b3f154e17cc89b6eea277dbdf5c93a)
+///
+/// # Safety
+/// 1. The memory should have been allocated with malloc_sync
+pub unsafe fn free_sync(dptr: sys::CUdeviceptr) -> Result<(), DriverError> {
+    sys::cuMemFree_v2(dptr).result()
 }
 
 /// Frees device memory.
@@ -343,6 +975,21 @@ pub unsafe fn memset_d8_async(
     sys::cuMemsetD8Async(dptr, uc, num_bytes, stream).result()
 }
 
+/// Sets device memory with stream ordered semantics.
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g6e582bf866e9e2fb014297bfaf354d7b)
+///
+/// # Safety
+/// 1. The resulting memory pattern may not be valid for `T`.
+/// 2. The device pointer should not have been freed already (double free)
+pub unsafe fn memset_d8_sync(
+    dptr: sys::CUdeviceptr,
+    uc: c_uchar,
+    num_bytes: usize,
+) -> Result<(), DriverError> {
+    sys::cuMemsetD8_v2(dptr, uc, num_bytes).result()
+}
+
 /// Copies memory from Host to Device with stream ordered semantics.
 ///
 /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g4d32266788c440b0220b1a9ba5795169)
@@ -363,10 +1010,23 @@ pub unsafe fn memcpy_htod_async<T>(
     sys::cuMemcpyHtoDAsync_v2(
         dst,
         src.as_ptr() as *const _,
-        src.len() * size_of::<T>(),
+        std::mem::size_of_val(src),
         stream,
     )
     .result()
+}
+
+/// Copies memory from Host to Device
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g4d32266788c440b0220b1a9ba5795169)
+///
+/// # Safety
+/// **This function is synchronous**///
+/// 1. `T` must be the type that device pointer was allocated with.
+/// 2. The device pointer should not have been freed already (double free)
+/// 3. `src` must not be moved
+pub unsafe fn memcpy_htod_sync<T>(dst: sys::CUdeviceptr, src: &[T]) -> Result<(), DriverError> {
+    sys::cuMemcpyHtoD_v2(dst, src.as_ptr() as *const _, std::mem::size_of_val(src)).result()
 }
 
 /// Copies memory from Device to Host with stream ordered semantics.
@@ -388,10 +1048,23 @@ pub unsafe fn memcpy_dtoh_async<T>(
     sys::cuMemcpyDtoHAsync_v2(
         dst.as_mut_ptr() as *mut _,
         src,
-        dst.len() * size_of::<T>(),
+        std::mem::size_of_val(dst),
         stream,
     )
     .result()
+}
+
+/// Copies memory from Device to Host with stream ordered semantics.
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g3480368ee0208a98f75019c9a8450893)
+///
+/// # Safety
+/// **This function is synchronous**
+///
+/// 1. `T` must be the type that device pointer was allocated with.
+/// 2. The device pointer should not have been freed already (double free)
+pub unsafe fn memcpy_dtoh_sync<T>(dst: &mut [T], src: sys::CUdeviceptr) -> Result<(), DriverError> {
+    sys::cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut _, src, std::mem::size_of_val(dst)).result()
 }
 
 /// Copies memory from Device to Device with stream ordered semantics.
@@ -411,6 +1084,38 @@ pub unsafe fn memcpy_dtod_async(
     sys::cuMemcpyDtoDAsync_v2(dst, src, num_bytes, stream).result()
 }
 
+/// Copies memory from Device to Device
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g1725774abf8b51b91945f3336b778c8b)
+///
+/// # Safety
+/// 1. `T` must be the type that BOTH device pointers were allocated with.
+/// 2. Neither device pointer should not have been freed already (double free)
+pub unsafe fn memcpy_dtod_sync(
+    dst: sys::CUdeviceptr,
+    src: sys::CUdeviceptr,
+    num_bytes: usize,
+) -> Result<(), DriverError> {
+    sys::cuMemcpyDtoD_v2(dst, src, num_bytes).result()
+}
+
+/// Copies device memory between two contexts asynchronously.
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g82fcecb38018e64b98616a8ac30112f2)
+///
+/// # Safety
+/// 1. Neither device pointer should have been freed (double free)
+pub unsafe fn memcpy_peer_async(
+    dst_ctx: sys::CUcontext,
+    dst: sys::CUdeviceptr,
+    src_ctx: sys::CUcontext,
+    src: sys::CUdeviceptr,
+    num_bytes: usize,
+    stream: sys::CUstream,
+) -> Result<(), DriverError> {
+    sys::cuMemcpyPeerAsync(dst, dst_ctx, src, src_ctx, num_bytes, stream).result()
+}
+
 /// Returns (free, total) memory in bytes.
 ///
 /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g808f555540d0143a331cc42aa98835c0)
@@ -426,7 +1131,10 @@ pub mod module {
     //!
     //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE)
 
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
     use core::ffi::c_void;
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -476,6 +1184,24 @@ pub mod module {
         Ok(func.assume_init())
     }
 
+    /// Returns a pointer to a global/constant symbol in the module.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1gf3e43972c23c2d5c8a662f2d9a4d0c24)
+    ///
+    /// # Safety
+    /// `module` must be a properly allocated and not freed module.
+    pub unsafe fn get_global(
+        module: sys::CUmodule,
+        name: CString,
+    ) -> Result<(sys::CUdeviceptr, usize), DriverError> {
+        let name_ptr = name.as_c_str().as_ptr();
+        let mut dptr = MaybeUninit::uninit();
+        let mut bytes = MaybeUninit::uninit();
+        sys::cuModuleGetGlobal_v2(dptr.as_mut_ptr(), bytes.as_mut_ptr(), module, name_ptr)
+            .result()?;
+        Ok((dptr.assume_init(), bytes.assume_init()))
+    }
+
     /// Unloads a module.
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g8ea3d716524369de3763104ced4ea57b)
@@ -488,7 +1214,10 @@ pub mod module {
 }
 
 pub mod event {
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
     use std::mem::MaybeUninit;
 
     /// Creates an event.
@@ -522,9 +1251,46 @@ pub mod event {
     pub unsafe fn elapsed(start: sys::CUevent, end: sys::CUevent) -> Result<f32, DriverError> {
         let mut ms: f32 = 0.0;
         unsafe {
+            #[cfg(not(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            )))]
             sys::cuEventElapsedTime((&mut ms) as *mut _, start, end).result()?;
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            ))]
+            sys::cuEventElapsedTime_v2((&mut ms) as *mut _, start, end).result()?;
         }
         Ok(ms)
+    }
+
+    /// Queries an event's status.
+    /// Returns `Ok` if all captured work has been completed, or `Err`: `CUDA_ERROR_NOT_READY` if
+    /// any captured work is incomplete.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EVENT.html#group__CUDA__EVENT_1g6f0704d755066b0ee705749ae911deef)
+    ///
+    /// # Safety
+    /// This function is unsafe because event can be a null event, in which case
+    pub unsafe fn query(event: sys::CUevent) -> Result<(), DriverError> {
+        unsafe { sys::cuEventQuery(event).result() }
+    }
+
+    /// Waits for an event to complete.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EVENT.html#group__CUDA__EVENT_1g9e520d34e51af7f5375610bca4add99c)
+    ///
+    /// # Safety
+    /// This function is unsafe because event can be a null event, in which case
+    pub unsafe fn synchronize(event: sys::CUevent) -> Result<(), DriverError> {
+        unsafe { sys::cuEventSynchronize(event).result() }
     }
 
     /// Destroys an event.
@@ -551,10 +1317,10 @@ pub mod event {
 ///
 /// 1. The cuda function must be a valid handle returned from a non-unloaded module.
 /// 2. This is asynchronous, so the results of calling this function happen
-/// at a later point after this function returns.
+///    at a later point after this function returns.
 /// 3. All parameters used for this kernel should have been allocated by stream (I think?)
 /// 4. The cuda kernel has mutable access to every parameter, that means every parameter
-/// can change at a later point after callign this function. *Even non-mutable references*.
+///    can change at a later point after callign this function. *Even non-mutable references*.
 #[inline]
 pub unsafe fn launch_kernel(
     f: sys::CUfunction,
@@ -580,10 +1346,50 @@ pub unsafe fn launch_kernel(
     .result()
 }
 
+/// Launches a cuda functions
+///
+/// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g06d753134145c4584c0c62525c1894cb)
+///
+/// # Safety
+/// This method is **very unsafe**.
+///
+/// 1. The cuda function must be a valid handle returned from a non-unloaded module.
+/// 2. This is asynchronous, so the results of calling this function happen
+///    at a later point after this function returns.
+/// 3. All parameters used for this kernel should have been allocated by stream (I think?)
+/// 4. The cuda kernel has mutable access to every parameter, that means every parameter
+///    can change at a later point after callign this function. *Even non-mutable references*.
+#[inline]
+pub unsafe fn launch_cooperative_kernel(
+    f: sys::CUfunction,
+    grid_dim: (c_uint, c_uint, c_uint),
+    block_dim: (c_uint, c_uint, c_uint),
+    shared_mem_bytes: c_uint,
+    stream: sys::CUstream,
+    kernel_params: &mut [*mut c_void],
+) -> Result<(), DriverError> {
+    sys::cuLaunchCooperativeKernel(
+        f,
+        grid_dim.0,
+        grid_dim.1,
+        grid_dim.2,
+        block_dim.0,
+        block_dim.1,
+        block_dim.2,
+        shared_mem_bytes,
+        stream,
+        kernel_params.as_mut_ptr(),
+    )
+    .result()
+}
+
 pub mod external_memory {
     use std::mem::MaybeUninit;
 
-    use super::{sys, DriverError};
+    use super::{
+        sys::{self},
+        DriverError,
+    };
 
     /// Imports an external memory object, in this case an OpaqueFd.
     ///
@@ -603,7 +1409,8 @@ pub mod external_memory {
             type_: sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
             handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 { fd },
             size,
-            ..Default::default()
+            flags: 0,
+            reserved: [0; 16],
         };
         sys::cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description).result()?;
         Ok(external_memory.assume_init())
@@ -632,7 +1439,8 @@ pub mod external_memory {
                 },
             },
             size,
-            ..Default::default()
+            flags: 0,
+            reserved: [0; 16],
         };
         sys::cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description).result()?;
         Ok(external_memory.assume_init())
@@ -668,7 +1476,8 @@ pub mod external_memory {
         let buffer_description = sys::CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
             offset,
             size,
-            ..Default::default()
+            flags: 0,
+            reserved: [0; 16],
         };
         sys::cuExternalMemoryGetMappedBuffer(
             device_ptr.as_mut_ptr(),
@@ -677,5 +1486,198 @@ pub mod external_memory {
         )
         .result()?;
         Ok(device_ptr.assume_init())
+    }
+}
+
+pub mod graph {
+    use super::*;
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gb53b435e178cccfa37ac87285d2c3fa1)
+    ///
+    /// Pass `sys::CUgraphInstantiate_flags(0)` for default behavior, or combine flags with `|`.
+    ///
+    /// # Safety
+    /// graph must be valid
+    pub unsafe fn instantiate(
+        graph: sys::CUgraph,
+        flags: sys::CUgraphInstantiate_flags,
+    ) -> Result<sys::CUgraphExec, DriverError> {
+        let mut graph_exec = MaybeUninit::uninit();
+        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, u64::from(flags.0))
+            .result()?;
+        Ok(graph_exec.assume_init())
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1ga32ad4944cc5d408158207c978bc43a7)
+    /// # Safety
+    /// graph_exec must be valid
+    pub unsafe fn exec_destroy(graph_exec: sys::CUgraphExec) -> Result<(), DriverError> {
+        sys::cuGraphExecDestroy(graph_exec).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1g718cfd9681f078693d4be2426fd689c8)
+    /// # Safety
+    /// graph must be valid
+    pub unsafe fn destroy(graph: sys::CUgraph) -> Result<(), DriverError> {
+        sys::cuGraphDestroy(graph).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1g6b2dceb3901e71a390d2bd8b0491e471)
+    /// # Safety
+    /// graph & stream must be valid
+    pub unsafe fn launch(
+        graph_exec: sys::CUgraphExec,
+        stream: sys::CUstream,
+    ) -> Result<(), DriverError> {
+        sys::cuGraphLaunch(graph_exec, stream).result()
+    }
+
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gdb81438b083d42a26693f6f2bce150cd)
+    /// # Safety
+    /// graph_exec and stream must be valid
+    pub unsafe fn upload(
+        graph_exec: sys::CUgraphExec,
+        stream: sys::CUstream,
+    ) -> Result<(), DriverError> {
+        sys::cuGraphUpload(graph_exec, stream).result()
+    }
+}
+
+pub mod mem_pool {
+    //! Memory pool management functions (`cuMemPool*`).
+    //!
+    //! See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html)
+
+    use super::*;
+
+    /// Create a memory pool.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g8aa7ef8b06b0df48350794e1e8bba704)
+    ///
+    /// # Safety
+    /// `pool_props` must point to a valid [sys::CUmemPoolProps].
+    pub unsafe fn create(
+        pool_props: *const sys::CUmemPoolProps,
+    ) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuMemPoolCreate(pool.as_mut_ptr(), pool_props).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Destroy a memory pool.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1gd12c583ad4fe7e3a3338e65e413dfd1e)
+    ///
+    /// # Safety
+    /// Pool must be valid and not already destroyed.
+    pub unsafe fn destroy(pool: sys::CUmemoryPool) -> Result<(), DriverError> {
+        sys::cuMemPoolDestroy(pool).result()
+    }
+
+    /// Release unused memory back to the OS.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g6b3f1ea779bda578c8e26101caa3d958)
+    ///
+    /// # Safety
+    /// Pool must be valid.
+    pub unsafe fn trim_to(
+        pool: sys::CUmemoryPool,
+        min_bytes_to_keep: usize,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolTrimTo(pool, min_bytes_to_keep).result()
+    }
+
+    /// Get a pool attribute.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1gdc3766ee0671e498e6ba03de08e00e5c)
+    ///
+    /// # Safety
+    /// Pool must be valid. `value` must point to memory of the correct
+    /// type for the given attribute.
+    pub unsafe fn get_attribute(
+        pool: sys::CUmemoryPool,
+        attr: sys::CUmemPool_attribute,
+        value: *mut core::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolGetAttribute(pool, attr, value).result()
+    }
+
+    /// Set a pool attribute.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g1ef006cd08dbf0ec5e4cb93bf7b044dc)
+    ///
+    /// # Safety
+    /// Pool must be valid. `value` must point to memory of the correct
+    /// type for the given attribute.
+    pub unsafe fn set_attribute(
+        pool: sys::CUmemoryPool,
+        attr: sys::CUmemPool_attribute,
+        value: *mut core::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolSetAttribute(pool, attr, value).result()
+    }
+
+    /// Allocate memory from a pool with stream-ordered semantics.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g0968906e6892e4f7e0e04ef5e5e0b416)
+    ///
+    /// # Safety
+    /// 1. Pool and stream must be valid.
+    /// 2. The returned memory is uninitialized.
+    pub unsafe fn alloc_async(
+        pool: sys::CUmemoryPool,
+        num_bytes: usize,
+        stream: sys::CUstream,
+    ) -> Result<sys::CUdeviceptr, DriverError> {
+        let mut dptr = MaybeUninit::uninit();
+        sys::cuMemAllocFromPoolAsync(dptr.as_mut_ptr(), num_bytes, pool, stream).result()?;
+        Ok(dptr.assume_init())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::safe::{CudaContext, CudaSlice};
+    use super::*;
+
+    #[test]
+    #[ignore = "must be executed with multiple gpus"]
+    fn peer_transfer_contexts() -> Result<(), DriverError> {
+        let ctx1 = CudaContext::new(0)?;
+        let stream1 = ctx1.default_stream();
+        let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
+
+        let ctx2 = CudaContext::new(1)?;
+        let stream2 = ctx2.default_stream();
+        let b = stream2.clone_dtod(&a)?;
+        let _ = stream1.clone_dtoh(&a)?;
+        let _ = stream2.clone_dtoh(&b)?;
+        Ok(())
+    }
+
+    #[test]
+    fn peer_transfer_self() -> Result<(), DriverError> {
+        let ctx1 = CudaContext::new(0)?;
+        let stream1 = ctx1.default_stream();
+        let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
+
+        let ctx2 = CudaContext::new(0)?;
+        let stream2 = ctx2.default_stream();
+        let b = stream2.clone_dtod(&a)?;
+        let _ = stream1.clone_dtoh(&a)?;
+        let _ = stream2.clone_dtoh(&b)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "must be executed with multiple gpus"]
+    fn re_associate_context_for_memory_op() -> Result<(), DriverError> {
+        let ctx1 = CudaContext::new(0)?;
+        let stream1 = ctx1.default_stream();
+        let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
+
+        let _ctx2 = CudaContext::new(1)?;
+
+        stream1.clone_dtoh(&a).map(|_| ())
     }
 }

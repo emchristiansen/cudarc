@@ -103,7 +103,7 @@ pub struct ReduceTensor<'a, T: CudnnDataType, Idx> {
     pub c: &'a TensorDescriptor<T>,
 }
 
-impl<'a, T: CudnnDataType> ReduceTensor<'a, T, FlatIndices> {
+impl<T: CudnnDataType> ReduceTensor<'_, T, FlatIndices> {
     /// Get's the size of the indices tensor required for this operation.
     ///
     /// See [nvidia docs](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnGetReductionIndicesSize).
@@ -119,7 +119,7 @@ impl<'a, T: CudnnDataType> ReduceTensor<'a, T, FlatIndices> {
     }
 }
 
-impl<'a, T: CudnnDataType, Idx> ReduceTensor<'a, T, Idx> {
+impl<T: CudnnDataType, Idx> ReduceTensor<'_, T, Idx> {
     /// Gets the size of the workspace for this operation.
     ///
     /// See [nvidia docs](https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnGetReductionWorkspaceSize)
@@ -135,7 +135,7 @@ impl<'a, T: CudnnDataType, Idx> ReduceTensor<'a, T, Idx> {
     }
 }
 
-impl<'a, T: CudnnDataType> ReduceTensor<'a, T, FlatIndices> {
+impl<T: CudnnDataType> ReduceTensor<'_, T, FlatIndices> {
     /// Launches the operation with indices.
     ///
     /// # Safety
@@ -155,24 +155,31 @@ impl<'a, T: CudnnDataType> ReduceTensor<'a, T, FlatIndices> {
         A: DevicePtr<T>,
         C: DevicePtrMut<T>,
     {
+        let stream = &self.a.handle.stream;
+        let workspace_size_in_bytes = workspace.num_bytes();
+        let indices_size_in_bytes = indices.num_bytes();
+        let (indices, _record_i) = indices.device_ptr_mut(stream);
+        let (workspace, _record_w) = workspace.device_ptr_mut(stream);
+        let (a, _record_a) = a.device_ptr(stream);
+        let (c, _record_c) = c.device_ptr_mut(stream);
         result::reduce_tensor(
             self.reduce.handle.handle,
             self.reduce.desc,
-            *indices.device_ptr_mut() as *mut std::ffi::c_void,
-            indices.num_bytes(),
-            *workspace.device_ptr_mut() as *mut std::ffi::c_void,
-            workspace.num_bytes(),
+            indices as *mut std::ffi::c_void,
+            indices_size_in_bytes,
+            workspace as *mut std::ffi::c_void,
+            workspace_size_in_bytes,
             (&alpha) as *const T as *const std::ffi::c_void,
             self.a.desc,
-            *a.device_ptr() as *const _,
+            a as *const _,
             (&beta) as *const T as *const std::ffi::c_void,
             self.c.desc,
-            *c.device_ptr_mut() as *mut _,
+            c as *mut _,
         )
     }
 }
 
-impl<'a, T: CudnnDataType> ReduceTensor<'a, T, NoIndices> {
+impl<T: CudnnDataType> ReduceTensor<'_, T, NoIndices> {
     /// Launches the operation with no indices.
     ///
     /// # Safety
@@ -190,19 +197,24 @@ impl<'a, T: CudnnDataType> ReduceTensor<'a, T, NoIndices> {
         A: DevicePtr<T>,
         C: DevicePtrMut<T>,
     {
+        let stream = &self.a.handle.stream;
+        let workspace_size_in_bytes = workspace.num_bytes();
+        let (workspace, _record_w) = workspace.device_ptr_mut(stream);
+        let (a, _record_a) = a.device_ptr(stream);
+        let (c, _record_c) = c.device_ptr_mut(stream);
         result::reduce_tensor(
             self.reduce.handle.handle,
             self.reduce.desc,
             std::ptr::null_mut(),
             0,
-            *workspace.device_ptr_mut() as *mut std::ffi::c_void,
-            workspace.num_bytes(),
+            workspace as *mut std::ffi::c_void,
+            workspace_size_in_bytes,
             (&alpha) as *const T as *const std::ffi::c_void,
             self.a.desc,
-            *a.device_ptr() as *const _,
+            a as *const _,
             (&beta) as *const T as *const std::ffi::c_void,
             self.c.desc,
-            *c.device_ptr_mut() as *mut _,
+            c as *mut _,
         )
     }
 }
